@@ -1,0 +1,8 @@
+/target
+.venv/
+# local env
+.venv/
+.env
+
+# rust
+/target
