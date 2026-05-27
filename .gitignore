@@ -6,3 +6,7 @@
 
 # rust
 /target
+__pycache__/
+
+*.py[cod]
+
