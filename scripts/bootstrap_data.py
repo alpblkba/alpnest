@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize alpnest's local data directories and store files."""
+"""init alpnest's local data directories and store files."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from paths import (
     EVENTSTREAMS_JSON,
     GENERATED_DIR,
     LOG_DIR,
+    MAIL_DECOMPOSITION_MD,
     MAIL_MD,
+    MAIL_SYNC_STATE_JSON,
     MESSAGES_JSON,
     RAW_MAIL_DIR,
     STORE_DIR,
@@ -24,10 +26,15 @@ EMPTY_JSON_FILES = {
     MESSAGES_JSON: [],
     EVENTSTREAMS_JSON: [],
     TASKS_JSON: [],
+    MAIL_SYNC_STATE_JSON: {
+        "targets": {},
+        "last_run_at": None,
+    },
 }
 
 EMPTY_MARKDOWN_FILES = {
     MAIL_MD: "# mail\n\nNo mail events synced yet.\n",
+    MAIL_DECOMPOSITION_MD: "# mail decomposition\n\nNo mail events synced yet.\n",
     TODAY_MD: "# today\n\nNo generated plan yet.\n",
     CALENDAR_MD: "# calendar\n\nNo calendar events synced yet.\n",
 }
@@ -49,7 +56,7 @@ def write_json_if_missing(path: Path, value: object) -> None:
     if path.exists():
         return
 
-    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def write_text_if_missing(path: Path, value: str) -> None:

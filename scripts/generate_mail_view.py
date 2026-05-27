@@ -1,7 +1,5 @@
-
-
 #!/usr/bin/env python3
-"""Render the normalized alpnest mail store into a markdown view."""
+"""render the normalized alpnest mail store into a markdown view."""
 
 from __future__ import annotations
 
@@ -61,6 +59,16 @@ def message_lookup(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return lookup
 
 
+def account_counts(messages: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
+    for message in messages:
+        account = compact(message.get("account"), "unknown")
+        counts[account] = counts.get(account, 0) + 1
+
+    return counts
+
+
 def latest_message_for_stream(
     stream: dict[str, Any],
     messages_by_id: dict[str, dict[str, Any]],
@@ -82,6 +90,7 @@ def render_stream(
 ) -> list[str]:
     latest_message = latest_message_for_stream(stream, messages_by_id)
 
+    account = compact(stream.get("account"), "unknown")
     sender = compact(stream.get("sender_key"), "unknown sender")
     subject = compact(stream.get("subject_key"), "unknown subject")
     status = compact(stream.get("status"), "active")
@@ -90,8 +99,9 @@ def render_stream(
     latest_at = normalize_datetime(stream.get("latest_at"))
 
     lines = [
-        f"## {sender} / {subject}",
+        f"## [{account}] {sender} / {subject}",
         "",
+        f"- account: `{account}`",
         f"- status: `{status}`",
         f"- category: `{category}`",
         f"- latest: {latest_at}",
@@ -103,6 +113,9 @@ def render_stream(
             [
                 f"- latest sender: {compact(latest_message.get('sender'))}",
                 f"- latest subject: {compact(latest_message.get('subject'))}",
+                f"- mailbox: {compact(latest_message.get('mailbox'))} / {compact(latest_message.get('mailbox_name'))}",
+                f"- body status: {compact(latest_message.get('body_status'), 'unknown')}",
+                f"- body sync: {compact(latest_message.get('body_sync_policy'), 'unknown')}",
                 f"- snippet: {compact(latest_message.get('snippet'), 'No snippet.')}",
             ]
         )
@@ -123,6 +136,7 @@ def render_unstreamed_messages(messages: list[dict[str, Any]]) -> list[str]:
     lines = ["# unstreamed messages", ""]
 
     for message in messages:
+        account = compact(message.get("account"))
         sender = compact(message.get("sender"))
         subject = compact(message.get("subject"))
         received_at = normalize_datetime(message.get("received_at"))
@@ -130,7 +144,7 @@ def render_unstreamed_messages(messages: list[dict[str, Any]]) -> list[str]:
 
         lines.extend(
             [
-                f"## {sender}",
+                f"## [{account}] {sender}",
                 "",
                 f"- subject: {subject}",
                 f"- received: {received_at}",
@@ -147,14 +161,21 @@ def render_mail_view(
     eventstreams: list[dict[str, Any]],
 ) -> str:
     messages_by_id = message_lookup(messages)
+    counts = account_counts(messages)
 
     lines = [
         "# mail",
         "",
         f"- messages: {len(messages)}",
         f"- event streams: {len(eventstreams)}",
-        "",
     ]
+
+    if counts:
+        lines.append("- accounts:")
+        for account, count in sorted(counts.items()):
+            lines.append(f"  - {account}: {count}")
+
+    lines.append("")
 
     if eventstreams:
         lines.extend(["# event streams", ""])

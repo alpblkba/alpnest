@@ -13,6 +13,8 @@ EVENTSTREAMS_JSON = STORE_DIR / "eventstreams.json"
 TASKS_JSON = STORE_DIR / "tasks.json"
 
 MAIL_MD = GENERATED_DIR / "mail.md"
+MAIL_DECOMPOSITION_MD = GENERATED_DIR / "mail_decomposition.md"
+MAIL_SYNC_STATE_JSON = STORE_DIR / "mail_sync_state.json"
 TODAY_MD = GENERATED_DIR / "today.md"
 CALENDAR_MD = GENERATED_DIR / "calendar.md"
 
