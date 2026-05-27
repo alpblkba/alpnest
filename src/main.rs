@@ -17,7 +17,6 @@ enum Panel {
     School,
     Projects,
     Mail,
-    ChatGpt,
 }
 
 impl Panel {
@@ -27,7 +26,6 @@ impl Panel {
             Panel::School,
             Panel::Projects,
             Panel::Mail,
-            Panel::ChatGpt,
         ]
     }
 
@@ -37,7 +35,6 @@ impl Panel {
             Panel::School => "school",
             Panel::Projects => "projects",
             Panel::Mail => "mail",
-            Panel::ChatGpt => "chatgpt",
         }
     }
 }
@@ -174,7 +171,6 @@ impl App {
             Panel::School => "data/school.md",
             Panel::Projects => "data/projects.md",
             Panel::Mail => "data/mail.md",
-            Panel::ChatGpt => "data/chatgpt.md",
         };
 
         let text = fs::read_to_string(path)
