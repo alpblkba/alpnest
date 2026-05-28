@@ -158,6 +158,7 @@ tell application "Mail"
         set theReadStatus to read status of m as string
         {body_script}
         set outputText to outputText & "{account_name}" & "{FIELD_SEPARATOR}" & "{mailbox_name}" & "{FIELD_SEPARATOR}" & theId & "{FIELD_SEPARATOR}" & theSender & "{FIELD_SEPARATOR}" & theSubject & "{FIELD_SEPARATOR}" & theDate & "{FIELD_SEPARATOR}" & theReadStatus & "{FIELD_SEPARATOR}" & originalLength & "{FIELD_SEPARATOR}" & truncatedFlag & "{FIELD_SEPARATOR}" & theContent & "{RECORD_SEPARATOR}"
+    end repeat
 
     return outputText
 end tell

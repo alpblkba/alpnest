@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Summarize and lightly classify local mail event streams.
 
-This script is intentionally optional. It uses Ollama when available and falls
-back to deterministic summaries when Ollama is unavailable, slow, or returns
-invalid JSON.
+This script uses a prompt pack under prompts/qwen/mail_summarizer/ to shape
+qwen3:8b into a narrow local mail summarizer intern.
 
 Input:
   ~/.local/share/alpnest/store/messages.json
   ~/.local/share/alpnest/store/eventstreams.json
 
 Output:
-  updated eventstreams.json with display/summary/category/noise fields
+  updated eventstreams.json with display/summary/category/action/review fields
 """
 
 from __future__ import annotations
@@ -19,19 +18,32 @@ import argparse
 import configparser
 import json
 import re
-import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from paths import EVENTSTREAMS_JSON, MESSAGES_JSON
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIL_FILTERS_CFG = Path(__file__).with_name("mail_filters.cfg")
+DEFAULT_PROMPT_DIR = REPO_ROOT / "prompts/qwen/mail_summarizer"
 
 DEFAULT_MODEL = "qwen3:8b"
 DEFAULT_LIMIT = 10
-OLLAMA_TIMEOUT_SECONDS = 90
-MAX_BODY_CHARS_FOR_PROMPT = 2500
+OLLAMA_TIMEOUT_SECONDS = 180
+MAX_BODY_CHARS_FOR_PROMPT = 4000
+
+PROMPT_FILES = [
+    "system.md",
+    "context.md",
+    "task.md",
+    "output_schema.md",
+    "rubric.md",
+    "examples.md",
+    "failure_modes.md",
+]
 
 VALID_CATEGORIES = {
     "school",
@@ -48,6 +60,61 @@ VALID_CATEGORIES = {
     "noise",
     "unknown",
 }
+
+VALID_LANGUAGES = {"tr", "en", "de", "mixed", "unknown"}
+
+OLLAMA_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "display_sender": {"type": "string"},
+        "display_subject": {"type": "string"},
+        "summary": {"type": "string"},
+        "category": {
+            "type": "string",
+            "enum": [
+                "school",
+                "admin",
+                "meeting",
+                "assignment",
+                "exam",
+                "lab",
+                "seminar",
+                "research",
+                "opportunity",
+                "newsletter",
+                "social",
+                "noise",
+                "unknown",
+            ],
+        },
+        "action_required": {"type": "boolean"},
+        "action": {"type": ["string", "null"]},
+        "deadline": {"type": ["string", "null"]},
+        "date_or_time": {"type": ["string", "null"]},
+        "language": {
+            "type": "string",
+            "enum": ["tr", "en", "de", "mixed", "unknown"],
+        },
+        "noise": {"type": "boolean"},
+        "needs_human_review": {"type": "boolean"},
+        "confidence": {"type": "number"},
+    },
+    "required": [
+        "display_sender",
+        "display_subject",
+        "summary",
+        "category",
+        "action_required",
+        "action",
+        "deadline",
+        "date_or_time",
+        "language",
+        "noise",
+        "needs_human_review",
+        "confidence",
+    ],
+}
+
 
 DEFAULT_IGNORE_SENDER_PATTERNS = [
     "facebookmail.com",
@@ -139,6 +206,22 @@ def read_mail_filters(path: Path = MAIL_FILTERS_CFG) -> dict[str, list[str]]:
     }
 
 
+def read_prompt_pack(prompt_dir: Path) -> str:
+    sections = []
+
+    for name in PROMPT_FILES:
+        path = prompt_dir / name
+        if not path.exists():
+            continue
+
+        sections.append(f"# {name}\n\n{path.read_text(encoding='utf-8').strip()}")
+
+    if not sections:
+        raise FileNotFoundError(f"no prompt files found in {prompt_dir}")
+
+    return "\n\n---\n\n".join(sections)
+
+
 def compact(value: object, fallback: str = "") -> str:
     if value is None:
         return fallback
@@ -154,7 +237,6 @@ def normalize_space(value: str) -> str:
 def strip_email_address(sender: str) -> str:
     sender = sender.strip()
 
-    # Common forms: "Name <mail@example.com>" or plain address.
     match = re.match(r"^(.*?)\s*<[^>]+>$", sender)
     if match:
         name = match.group(1).strip().strip('"')
@@ -173,6 +255,8 @@ def clean_subject(subject: str) -> str:
     text = subject.strip()
     text = re.sub(r"^\s*(re|fw|fwd|aw|wg)\s*:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^\[KIT-ILIAS\]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\[KIT-Student\]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\[computerscience-master\]\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text)
     return text.strip() or subject.strip()
 
@@ -212,7 +296,14 @@ def latest_message(
     if not messages:
         return None
 
-    return sorted(messages, key=lambda item: str(item.get("received_at", "")), reverse=True)[0]
+    return sorted(
+        messages,
+        key=lambda item: (
+            str(item.get("received_at", "")),
+            item.get("body_status") == "fetched",
+        ),
+        reverse=True,
+    )[0]
 
 
 def read_body_excerpt(message: dict[str, Any]) -> str:
@@ -230,6 +321,37 @@ def read_body_excerpt(message: dict[str, Any]) -> str:
         return ""
 
     return normalize_space(body)[:MAX_BODY_CHARS_FOR_PROMPT]
+
+
+def is_obvious_noise(message: dict[str, Any], filters: dict[str, list[str]]) -> bool:
+    sender = compact(message.get("sender"), "")
+    subject = compact(message.get("subject"), "")
+    body_status = compact(message.get("body_status"), "unknown")
+
+    haystack = f"{sender}\n{subject}".lower()
+
+    if body_status == "fetched":
+        return False
+
+    for pattern in filters["ignore_senders"] + filters["ignore_subjects"]:
+        if pattern.lower() in haystack:
+            return True
+
+    obvious_terms = [
+        "facebookmail.com",
+        "close_friend_updates",
+        "newsletter",
+        "webinar",
+        "unsubscribe",
+        "promo",
+        "promotion",
+        "discount",
+        "sale",
+        "live stream",
+        "onboarding tasks",
+    ]
+
+    return any(term in haystack for term in obvious_terms)
 
 
 def deterministic_category(
@@ -272,6 +394,7 @@ def fallback_summary(message: dict[str, Any], filters: dict[str, list[str]]) -> 
     subject = compact(message.get("subject"), "unknown subject")
     snippet = compact(message.get("snippet"), "")
     body = read_body_excerpt(message)
+    body_status = compact(message.get("body_status"), "unknown")
 
     display_sender = strip_email_address(sender)
     display_subject = clean_subject(subject)
@@ -284,17 +407,25 @@ def fallback_summary(message: dict[str, Any], filters: dict[str, list[str]]) -> 
         summary = f"Metadata-only mail: {display_subject}"
 
     category, noise = deterministic_category(sender, subject, snippet or body, filters)
+    needs_human_review = body_status != "fetched" and category in {"school", "admin", "assignment", "exam", "lab", "seminar"}
 
     return {
         "display_sender": display_sender,
         "display_subject": display_subject,
         "summary": summary,
         "category": category,
+        "action_required": False,
+        "action": None,
+        "deadline": None,
+        "date_or_time": None,
+        "language": "unknown",
         "noise": noise,
+        "needs_human_review": needs_human_review,
+        "confidence": 0.45 if needs_human_review else 0.6,
     }
 
 
-def build_prompt(message: dict[str, Any]) -> str:
+def build_prompt(message: dict[str, Any], prompt_pack: str) -> str:
     sender = compact(message.get("sender"), "unknown sender")
     subject = compact(message.get("subject"), "unknown subject")
     received_at = compact(message.get("received_at"), "unknown time")
@@ -306,36 +437,22 @@ def build_prompt(message: dict[str, Any]) -> str:
     payload = body or snippet or "metadata only; body not fetched"
 
     return f"""
-You are a local mail cleanup helper for a terminal productivity dashboard.
-Return compact JSON only. Do not use markdown. Do not add commentary.
+Use the following prompt contract and examples.
 
-Task:
-- Make the sender and subject human-readable.
-- Summarize the mail in one short sentence.
-- Classify it into exactly one category.
-- Mark obvious newsletters/social/onboarding/promotional mail as noise.
+{prompt_pack}
 
-Allowed categories:
-school, admin, meeting, assignment, exam, lab, seminar, research, opportunity, newsletter, social, noise, unknown
+---
 
-Mail metadata:
+Now summarize this mail.
+
+Input:
 account: {account}
-received_at: {received_at}
 sender: {sender}
 subject: {subject}
+received_at: {received_at}
 body_status: {body_status}
-
-Mail payload:
+payload:
 {payload}
-
-Return exactly this JSON shape:
-{{
-  "display_sender": "...",
-  "display_subject": "...",
-  "summary": "...",
-  "category": "school|admin|meeting|assignment|exam|lab|seminar|research|opportunity|newsletter|social|noise|unknown",
-  "noise": true
-}}
 """.strip()
 
 
@@ -363,15 +480,58 @@ def extract_json_object(value: str) -> dict[str, Any] | None:
 
 
 def ollama_generate(model: str, prompt: str) -> str:
-    result = subprocess.run(
-        ["ollama", "run", model, prompt],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=OLLAMA_TIMEOUT_SECONDS,
+    request_payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "format": OLLAMA_SUMMARY_SCHEMA,
+        "options": {
+            "temperature": 0.1,
+        },
+    }
+
+    request = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    return result.stdout.strip()
+    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+
+    return compact(response_payload.get("response"), "")
+
+
+def bool_from_model(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+
+    return fallback
+
+
+def nullable_string(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "unknown", "n/a"}:
+        return None
+
+    return text
+
+
+def confidence_from_model(value: Any, fallback: float) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+    return max(0.0, min(confidence, 1.0))
 
 
 def normalize_model_result(raw: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
@@ -379,24 +539,27 @@ def normalize_model_result(raw: dict[str, Any], fallback: dict[str, Any]) -> dic
     display_subject = compact(raw.get("display_subject"), fallback["display_subject"])
     summary = compact(raw.get("summary"), fallback["summary"])
     category = compact(raw.get("category"), fallback["category"]).lower()
+    language = compact(raw.get("language"), fallback["language"]).lower()
 
     if category not in VALID_CATEGORIES:
         category = fallback["category"]
 
-    noise_value = raw.get("noise", fallback["noise"])
-    if isinstance(noise_value, bool):
-        noise = noise_value
-    elif isinstance(noise_value, str):
-        noise = noise_value.strip().lower() in {"true", "yes", "1"}
-    else:
-        noise = bool(fallback["noise"])
+    if language not in VALID_LANGUAGES:
+        language = fallback["language"]
 
     return {
         "display_sender": display_sender[:120],
         "display_subject": display_subject[:180],
-        "summary": summary[:500],
+        "summary": summary[:700],
         "category": category,
-        "noise": noise,
+        "action_required": bool_from_model(raw.get("action_required"), fallback["action_required"]),
+        "action": nullable_string(raw.get("action")),
+        "deadline": nullable_string(raw.get("deadline")),
+        "date_or_time": nullable_string(raw.get("date_or_time")),
+        "language": language,
+        "noise": bool_from_model(raw.get("noise"), fallback["noise"]),
+        "needs_human_review": bool_from_model(raw.get("needs_human_review"), fallback["needs_human_review"]),
+        "confidence": confidence_from_model(raw.get("confidence"), fallback["confidence"]),
     }
 
 
@@ -405,15 +568,19 @@ def summarize_message(
     model: str,
     use_ollama: bool,
     filters: dict[str, list[str]],
+    prompt_pack: str,
 ) -> tuple[dict[str, Any], str]:
     fallback = fallback_summary(message, filters)
 
     if not use_ollama:
         return fallback, "fallback"
 
+    if is_obvious_noise(message, filters):
+        return fallback, "fallback:obvious-noise"
+
     try:
-        output = ollama_generate(model, build_prompt(message))
-    except (subprocess.SubprocessError, OSError):
+        output = ollama_generate(model, build_prompt(message, prompt_pack))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return fallback, "fallback"
 
     parsed = extract_json_object(output)
@@ -438,6 +605,7 @@ def summarize_streams(
     use_ollama: bool,
     force: bool,
     filters: dict[str, list[str]],
+    prompt_pack: str,
 ) -> tuple[list[dict[str, Any]], int]:
     messages_by_id = message_lookup(messages)
     updated = 0
@@ -453,13 +621,32 @@ def summarize_streams(
         if message is None:
             continue
 
-        summary, source = summarize_message(message, model, use_ollama, filters)
+        sender = compact(message.get("sender"), "unknown sender")
+        subject = compact(message.get("subject"), "unknown subject")
+        print(
+            f"[{updated + 1}/{limit}] summarizing: {sender} / {subject}",
+            flush=True,
+        )
+
+        summary, source = summarize_message(message, model, use_ollama, filters, prompt_pack)
+
+        print(
+            f"[{updated + 1}/{limit}] done: {summary['display_sender']} / {summary['display_subject']} ({source})",
+            flush=True,
+        )
 
         stream["display_sender"] = summary["display_sender"]
         stream["display_subject"] = summary["display_subject"]
         stream["summary_local"] = summary["summary"]
         stream["category_guess"] = summary["category"]
+        stream["action_required"] = summary["action_required"]
+        stream["action"] = summary["action"]
+        stream["deadline"] = summary["deadline"]
+        stream["date_or_time"] = summary["date_or_time"]
+        stream["language"] = summary["language"]
         stream["noise_guess"] = summary["noise"]
+        stream["needs_human_review"] = summary["needs_human_review"]
+        stream["summary_confidence"] = summary["confidence"]
         stream["summary_source"] = source
         stream["summary_updated_at"] = now_iso()
 
@@ -479,6 +666,11 @@ def parse_args() -> argparse.Namespace:
         default=str(MAIL_FILTERS_CFG),
         help=f"mail filter config path; default: {MAIL_FILTERS_CFG}",
     )
+    parser.add_argument(
+        "--prompt-dir",
+        default=str(DEFAULT_PROMPT_DIR),
+        help=f"prompt pack directory; default: {DEFAULT_PROMPT_DIR}",
+    )
     return parser.parse_args()
 
 
@@ -488,6 +680,7 @@ def main() -> int:
     messages = read_json_list(MESSAGES_JSON)
     eventstreams = read_json_list(EVENTSTREAMS_JSON)
     filters = read_mail_filters(Path(args.filters))
+    prompt_pack = read_prompt_pack(Path(args.prompt_dir))
 
     updated_streams, updated_count = summarize_streams(
         messages=messages,
@@ -497,12 +690,14 @@ def main() -> int:
         use_ollama=not args.no_ollama,
         force=args.force,
         filters=filters,
+        prompt_pack=prompt_pack,
     )
 
     write_json_list(EVENTSTREAMS_JSON, updated_streams)
 
     print(f"summarized streams: {updated_count}")
     print(f"mail filters: {Path(args.filters)}")
+    print(f"prompt dir: {Path(args.prompt_dir)}")
     print(f"event streams store: {EVENTSTREAMS_JSON}")
     return 0
 

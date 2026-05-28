@@ -120,7 +120,14 @@ def latest_message_for_stream(
     if not messages:
         return None
 
-    return sorted(messages, key=lambda item: str(item.get("received_at", "")), reverse=True)[0]
+    return sorted(
+        messages,
+        key=lambda item: (
+            str(item.get("received_at", "")),
+            item.get("body_status") == "fetched",
+        ),
+        reverse=True,
+    )[0]
 
 
 def stream_account(stream: dict[str, Any], latest_message: dict[str, Any] | None) -> str:
