@@ -15,10 +15,11 @@ The current version supports:
 - top-level panels for `today`, `school`, `projects`, and `mail`
 - nested views inside panels
 - generated local mail views for account-level mail inspection
-- Apple Mail metadata sync through local scripts
+- Apple Mail sync through local scripts, with optional body fetching
 - separate Gmail and KIT mail digests
 - local mail event streams grouped by account, sender, and subject
-- optional local mail summarization and light classification through Ollama, currently targeted at `qwen3:8b`
+- deterministic fallback and obvious-noise skipping before local model calls
+- optional local mail summarization and light classification through Ollama HTTP structured output, currently targeted at `qwen3:8b`
 - metadata-first mail ingestion, with body fetching kept optional
 - generated markdown views under the local alpnest data directory
 - fallback repository markdown files when generated local data does not exist
@@ -86,7 +87,7 @@ generated/mail_decomposition.md
   structured snapshot for later review and planning
 ```
 
-The summarizer is optional. If Ollama or the configured local model is not available, the system falls back to deterministic summaries and categories.
+The summarizer is optional. If Ollama or the configured local model is not available, the system falls back to deterministic summaries and categories. Obvious noise can be skipped before model calls.
 
 ## daemon
 
