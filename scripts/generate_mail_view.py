@@ -196,6 +196,52 @@ def stream_category(stream: dict[str, Any]) -> str:
     return category
 
 
+def visible_category_suffix(category: str) -> str:
+    if category in {"", "unknown", "uncategorized"}:
+        return ""
+
+    return f" ({category})"
+
+
+def summary_badge(stream: dict[str, Any], latest_message: dict[str, Any] | None) -> str:
+    source = compact(stream.get("summary_source"), "fallback")
+    body_status = compact(latest_message.get("body_status") if latest_message else None, "not_fetched")
+
+    badges = []
+
+    category = stream_category(stream)
+    if category not in {"", "unknown", "uncategorized"}:
+        badges.append(category)
+
+    if source.startswith("ollama:"):
+        badges.append("summarized")
+    elif body_status == "fetched":
+        badges.append("body")
+    else:
+        badges.append("metadata")
+
+    if bool(stream.get("needs_human_review")):
+        badges.append("review")
+
+    if bool(stream.get("action_required")):
+        badges.append("action")
+
+    if stream.get("deadline"):
+        badges.append("deadline")
+
+    return " ".join(f"[{badge}]" for badge in badges)
+
+
+def compact_stream_line(stream: dict[str, Any], latest_message: dict[str, Any] | None) -> str:
+    sender = stream_sender(stream, latest_message)
+    subject = stream_subject(stream, latest_message)
+    latest_at = normalize_datetime(stream.get("latest_at"))
+    badges = summary_badge(stream, latest_message)
+
+    suffix = f" {badges}" if badges else ""
+    return f"- {latest_at} · {sender}: {subject}{suffix}"
+
+
 def stream_is_noise(stream: dict[str, Any]) -> bool:
     value = stream.get("noise_guess")
     if isinstance(value, bool):
@@ -319,8 +365,7 @@ def render_noise_section(
         sender = stream_sender(stream, latest_message)
         subject = stream_subject(stream, latest_message)
         latest_at = normalize_datetime(stream.get("latest_at"))
-        category = stream_category(stream)
-        lines.append(f"- {latest_at} · {sender}: {subject} ({category})")
+        lines.append(compact_stream_line(stream, latest_message))
 
     if len(noise_pairs) > MAX_ACCOUNT_PREVIEW_ITEMS:
         lines.append(f"- ... {len(noise_pairs) - MAX_ACCOUNT_PREVIEW_ITEMS} more noise-like streams hidden")
@@ -341,24 +386,23 @@ def render_account_digest(
         f"# {account_display_name(account)} mail",
         "",
         f"{stats['streams']} streams · {stats['unread']} unread · {stats['visible']} visible · {stats['noise']} noise-like",
-        f"source: {account_view_path(account)}",
         "",
     ]
 
     if visible_pairs:
         for stream, latest_message in visible_pairs[:MAX_VISIBLE_STREAMS_PER_ACCOUNT]:
-            lines.extend(render_stream_card(stream, latest_message))
+            lines.append(compact_stream_line(stream, latest_message))
 
         if len(visible_pairs) > MAX_VISIBLE_STREAMS_PER_ACCOUNT:
             hidden_count = len(visible_pairs) - MAX_VISIBLE_STREAMS_PER_ACCOUNT
-            lines.append(f"... {hidden_count} more visible streams hidden from this compact digest")
-            lines.append("")
+            lines.append(f"- ... {hidden_count} more visible streams hidden")
+        lines.append("")
     else:
         lines.append("No non-noise mail streams for this account.")
         lines.append("")
 
     lines.extend(render_noise_section(pairs))
-    return "\n".join(lines)
+    return "".join(lines)
 
 
 def render_account_preview(
@@ -386,8 +430,7 @@ def render_account_preview(
         sender = stream_sender(stream, latest_message)
         subject = stream_subject(stream, latest_message)
         latest_at = normalize_datetime(stream.get("latest_at"))
-        category = stream_category(stream)
-        lines.append(f"- {latest_at} · {sender}: {subject} ({category})")
+        lines.append(compact_stream_line(stream, latest_message))
 
     if len(visible_pairs) > MAX_ACCOUNT_PREVIEW_ITEMS:
         lines.append(f"- ... {len(visible_pairs) - MAX_ACCOUNT_PREVIEW_ITEMS} more visible streams in {path.name}")
