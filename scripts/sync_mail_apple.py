@@ -155,9 +155,9 @@ tell application "Mail"
         set theSender to sender of m as string
         set theSubject to subject of m as string
         set theDate to date received of m as string
-{body_script}
-        set outputText to outputText & "{account_name}" & "{FIELD_SEPARATOR}" & "{mailbox_name}" & "{FIELD_SEPARATOR}" & theId & "{FIELD_SEPARATOR}" & theSender & "{FIELD_SEPARATOR}" & theSubject & "{FIELD_SEPARATOR}" & theDate & "{FIELD_SEPARATOR}" & originalLength & "{FIELD_SEPARATOR}" & truncatedFlag & "{FIELD_SEPARATOR}" & theContent & "{RECORD_SEPARATOR}"
-    end repeat
+        set theReadStatus to read status of m as string
+        {body_script}
+        set outputText to outputText & "{account_name}" & "{FIELD_SEPARATOR}" & "{mailbox_name}" & "{FIELD_SEPARATOR}" & theId & "{FIELD_SEPARATOR}" & theSender & "{FIELD_SEPARATOR}" & theSubject & "{FIELD_SEPARATOR}" & theDate & "{FIELD_SEPARATOR}" & theReadStatus & "{FIELD_SEPARATOR}" & originalLength & "{FIELD_SEPARATOR}" & truncatedFlag & "{FIELD_SEPARATOR}" & theContent & "{RECORD_SEPARATOR}"
 
     return outputText
 end tell
@@ -182,11 +182,11 @@ def parse_records(raw_output: str, mailbox_kind: str) -> list[dict[str, Any]]:
         if not raw_record:
             continue
 
-        parts = raw_record.split(FIELD_SEPARATOR, 8)
-        if len(parts) != 9:
+        parts = raw_record.split(FIELD_SEPARATOR, 9)
+        if len(parts) != 10:
             continue
 
-        account_name, mailbox_name, apple_id, sender, subject, received_at, body_length, body_truncated, body = parts
+        account_name, mailbox_name, apple_id, sender, subject, received_at, read_status, body_length, body_truncated, body = parts
 
         account = account_key(account_name)
         normalized_subject = normalize_subject(subject)
@@ -214,6 +214,8 @@ def parse_records(raw_output: str, mailbox_kind: str) -> list[dict[str, Any]]:
             "subject": subject.strip(),
             "subject_key": subject_key,
             "received_at": received_at.strip(),
+            "is_read": read_status.strip().lower() == "true",
+            "unread": read_status.strip().lower() != "true",
             "snippet": short_snippet(body) if body_was_fetched else "",
             "body_path": str(raw_path) if body_was_fetched else None,
             "body_length": int(body_length) if body_length.isdigit() else None,
