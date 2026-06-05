@@ -161,6 +161,17 @@ fn thread_from_stream(
         action: stream.action.clone(),
         deadline: stream.deadline.clone(),
         date_or_time: stream.date_or_time.clone(),
+        attention: stream
+            .attention
+            .clone()
+            .or_else(|| stream.attention_guess.clone()),
+        importance: stream
+            .importance
+            .clone()
+            .or_else(|| stream.importance_guess.clone()),
+        retention_hint: stream.retention_hint.clone(),
+        source_language: stream.source_language.clone(),
+        summary_language: stream.summary_language.clone(),
         summary_local: stream.summary_local.clone(),
         summary: stream.summary.clone(),
         summary_source: stream.summary_source.clone(),

@@ -127,6 +127,11 @@ pub struct MailThread {
     pub action: Option<String>,
     pub deadline: Option<String>,
     pub date_or_time: Option<String>,
+    pub attention: Option<String>,
+    pub importance: Option<String>,
+    pub retention_hint: Option<String>,
+    pub source_language: Option<String>,
+    pub summary_language: Option<String>,
     pub summary_local: Option<String>,
     pub summary: Option<String>,
     pub summary_source: Option<String>,
@@ -201,6 +206,20 @@ pub struct EventStream {
     pub deadline: Option<String>,
     #[serde(default)]
     pub date_or_time: Option<String>,
+    #[serde(default)]
+    pub attention: Option<String>,
+    #[serde(default)]
+    pub attention_guess: Option<String>,
+    #[serde(default)]
+    pub importance: Option<String>,
+    #[serde(default)]
+    pub importance_guess: Option<String>,
+    #[serde(default)]
+    pub retention_hint: Option<String>,
+    #[serde(default)]
+    pub source_language: Option<String>,
+    #[serde(default)]
+    pub summary_language: Option<String>,
     #[serde(default)]
     pub noise_guess: Option<bool>,
     #[serde(default)]

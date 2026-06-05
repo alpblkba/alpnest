@@ -86,6 +86,7 @@ fn account_slots(all_threads: &[MailThread], account: &str) -> Vec<AccountMailSl
     let mut visible: Vec<MailThread> = all_threads
         .iter()
         .filter(|thread| thread.account == account)
+        .filter(|thread| account_thread_is_visible(thread))
         .cloned()
         .collect();
     sort_threads(&mut visible);
@@ -100,6 +101,27 @@ fn account_slots(all_threads: &[MailThread], account: &str) -> Vec<AccountMailSl
             thread,
         })
         .collect()
+}
+
+fn account_thread_is_visible(thread: &MailThread) -> bool {
+    let attention = thread
+        .attention
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if attention == "hidden" {
+        return false;
+    }
+
+    if thread.noise_guess {
+        return false;
+    }
+
+    !matches!(
+        normalized_category(thread.category_guess.as_deref()).as_str(),
+        "noise" | "social" | "promotion" | "shopping"
+    )
 }
 
 fn render_account_projection(
@@ -305,7 +327,7 @@ fn render_compact_slots<'a>(
 }
 
 fn compact_slot_line(slot: &MailFeedSlot) -> String {
-    compact_projection_line(slot.slot_id.as_str(), &slot.thread)
+    compact_projection_line(slot.slot_id.as_str(), &slot.thread, true)
 }
 
 fn render_compact_account_slots<'a>(
@@ -321,7 +343,7 @@ fn render_compact_account_slots<'a>(
         wrote_any = true;
         push_line(
             &mut text,
-            compact_projection_line(slot.slot_id.as_str(), &slot.thread),
+            compact_projection_line(slot.slot_id.as_str(), &slot.thread, false),
         );
         push_line(&mut text, compact_summary_line(&slot.thread));
         push_line(&mut text, "");
@@ -334,19 +356,41 @@ fn render_compact_account_slots<'a>(
     text
 }
 
-fn compact_projection_line(slot_id: &str, thread: &MailThread) -> String {
+fn compact_projection_line(slot_id: &str, thread: &MailThread, overview: bool) -> String {
     let date = optional_or_dash(thread.latest_received_at.as_deref());
-    let category = optional_or_dash(thread.category_guess.as_deref());
+    let labels = compact_labels(thread, overview);
     let read_state = if thread.has_unread() {
         "unread"
     } else {
         "read"
     };
+    let label_text = if labels.is_empty() {
+        read_state.to_string()
+    } else {
+        format!("{}, {read_state}", labels.join(", "))
+    };
 
     format!(
-        "- {} · {}: {} ({category}, {read_state}) [{slot_id}]",
+        "- {} · {}: {} ({label_text}) [{slot_id}]",
         date, thread.display_sender, thread.display_subject
     )
+}
+
+fn compact_labels(thread: &MailThread, overview: bool) -> Vec<String> {
+    let mut labels = Vec::new();
+
+    let category = display_category(thread);
+    if category != "unknown" {
+        labels.push(category);
+    }
+
+    if overview {
+        if let Some(importance) = display_importance(thread) {
+            labels.push(importance);
+        }
+    }
+
+    labels
 }
 
 fn compact_summary_line(thread: &MailThread) -> String {
@@ -381,4 +425,269 @@ fn is_meaningful_category(value: Option<&str>) -> bool {
             "unknown" | "uncategorized" | "noise" | "newsletter" | "social"
         )
     })
+}
+
+fn display_category(thread: &MailThread) -> String {
+    let category = normalized_category(thread.category_guess.as_deref());
+    if !matches!(category.as_str(), "" | "unknown" | "uncategorized") {
+        return category;
+    }
+
+    infer_category(thread).unwrap_or("unknown").to_string()
+}
+
+fn display_importance(thread: &MailThread) -> Option<String> {
+    let importance = thread.importance.as_deref()?.trim().to_ascii_lowercase();
+    if matches!(importance.as_str(), "high" | "medium" | "low") {
+        Some(importance)
+    } else {
+        None
+    }
+}
+
+fn normalized_category(value: Option<&str>) -> String {
+    match value
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "uncategorized" => "unknown".to_string(),
+        "opportunity" => "career".to_string(),
+        "promo" => "promotion".to_string(),
+        "academic" => "school".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn infer_category(thread: &MailThread) -> Option<&'static str> {
+    let haystack = format!(
+        "{}\n{}\n{}\n{}",
+        thread.account,
+        thread.display_sender,
+        thread.display_subject,
+        thread.display_summary()
+    )
+    .to_ascii_lowercase();
+
+    if contains_any(&haystack, &["facebookmail.com", "reels", "memories"]) {
+        return Some("social");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "assignment",
+            "homework",
+            "hand-in",
+            "feedback",
+            "exercise",
+            "task",
+        ],
+    ) {
+        return Some("assignment");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "kit.edu",
+            "studium.kit.edu",
+            "lists.kit.edu",
+            "ilias",
+            "course",
+            "lecture",
+            "seminar",
+            "exam",
+        ],
+    ) {
+        return Some("school");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "verify",
+            "verification",
+            "password",
+            "2fa",
+            "two-factor",
+            "two factor",
+            "cloud account",
+            "security event",
+        ],
+    ) {
+        return Some("security");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "application",
+            "student assistant",
+            "internship",
+            "working student",
+            "fraunhofer",
+            "career",
+            "recruiting",
+        ],
+    ) {
+        return Some("application");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "github.com",
+            "sregym",
+            "rfc",
+            "pull request",
+            "hls",
+            "iot lab",
+        ],
+    ) {
+        return Some("project");
+    }
+
+    if contains_any(
+        &haystack,
+        &["hackathon", "registration", "approval", "opportunity"],
+    ) {
+        return Some("event");
+    }
+
+    if contains_any(
+        &haystack,
+        &[
+            "newsletter",
+            "unsubscribe",
+            "discount",
+            "% off",
+            "free shipping",
+            "promotion",
+            "marketing",
+            "sale",
+        ],
+    ) {
+        return Some("promotion");
+    }
+
+    None
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mail::filters::MailFilters;
+
+    fn thread(account: &str, sender: &str, subject: &str, sort_key: i64) -> MailThread {
+        MailThread {
+            id: format!("{account}-{sender}-{subject}"),
+            account: account.to_string(),
+            display_sender: sender.to_string(),
+            display_subject: subject.to_string(),
+            normalized_subject: subject.to_string(),
+            latest_sort_key: sort_key,
+            mails: vec![Mail {
+                account: Some(account.to_string()),
+                sender: Some(sender.to_string()),
+                subject: Some(subject.to_string()),
+                ..Mail::default()
+            }],
+            ..MailThread::default()
+        }
+    }
+
+    #[test]
+    fn filtered_threads_do_not_enter_account_slots() {
+        let filters = MailFilters::from_text("sender_contains = facebookmail.com");
+        let threads = filters.visible_threads(vec![
+            thread(
+                "gmail",
+                "Facebook <notification@facebookmail.com>",
+                "Noise",
+                2,
+            ),
+            thread("gmail", "Human <person@example.com>", "Useful", 1),
+        ]);
+        let slots = account_slots(&threads, "gmail");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].thread.display_subject, "Useful");
+        assert_eq!(slots[0].slot_id, "gmail0");
+    }
+
+    #[test]
+    fn account_slots_include_account_only_threads() {
+        let mut thread = thread(
+            "gmail",
+            "Useful <person@example.com>",
+            "Readable but not urgent",
+            1,
+        );
+        thread.attention = Some("account_only".to_string());
+        let slots = account_slots(&[thread], "gmail");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].slot_id, "gmail0");
+    }
+
+    #[test]
+    fn account_slots_include_overview_threads() {
+        let mut thread = thread(
+            "gmail",
+            "Security <security@example.com>",
+            "Verify your account",
+            1,
+        );
+        thread.attention = Some("overview".to_string());
+        let slots = account_slots(&[thread], "gmail");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].slot_id, "gmail0");
+    }
+
+    #[test]
+    fn account_slots_exclude_hidden_threads() {
+        let mut hidden = thread("gmail", "Noise <noise@example.com>", "Hidden promo", 2);
+        hidden.attention = Some("hidden".to_string());
+        hidden.category_guess = Some("promotion".to_string());
+
+        let visible = thread("gmail", "Human <person@example.com>", "Readable", 1);
+        let slots = account_slots(&[hidden, visible], "gmail");
+
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].thread.display_subject, "Readable");
+    }
+
+    #[test]
+    fn hidden_newsletter_promotion_does_not_render_in_account_feed() {
+        let mut hidden = thread("gmail", "Brain.fm", "5 days left.", 2);
+        hidden.attention = Some("hidden".to_string());
+        hidden.category_guess = Some("newsletter".to_string());
+
+        let mut visible = thread("gmail", "Human <person@example.com>", "Readable", 1);
+        visible.attention = Some("account_only".to_string());
+
+        let slots = account_slots(&[hidden, visible], "gmail");
+        let text = render_compact_account_slots("# Gmail mail", slots.iter());
+
+        assert!(!text.contains("Brain.fm"));
+        assert!(!text.contains("newsletter"));
+        assert!(text.contains("Readable"));
+    }
+
+    #[test]
+    fn compact_rows_do_not_show_uncategorized() {
+        let mut thread = thread("gmail", "Sender", "Plain note", 1);
+        thread.category_guess = Some("uncategorized".to_string());
+        let line = compact_projection_line("gmail0", &thread, false);
+
+        assert!(!line.contains("uncategorized"));
+        assert!(line.contains("(read)"));
+    }
 }
