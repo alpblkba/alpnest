@@ -36,10 +36,17 @@ struct PanelConfig {
     views: Vec<ViewConfig>,
 }
 
+#[derive(Clone, Debug)]
+struct DetailView {
+    title: String,
+    path: PathBuf,
+}
+
 struct App {
     panels: Vec<PanelConfig>,
     active_panel: usize,
     active_views: Vec<usize>,
+    active_detail: Option<DetailView>,
     mode: NavigationMode,
     content_cursor: usize,
     should_quit: bool,
@@ -54,6 +61,7 @@ impl App {
             panels,
             active_panel: 0,
             active_views,
+            active_detail: None,
             mode: NavigationMode::Panel,
             content_cursor: 0,
             should_quit: false,
@@ -83,11 +91,13 @@ impl App {
 
         let max = self.active_panel().views.len() - 1;
         self.active_views[self.active_panel] = index.min(max);
+        self.active_detail = None;
         self.content_cursor = 0;
     }
 
     fn next_panel(&mut self) {
         self.active_panel = (self.active_panel + 1) % self.panels.len();
+        self.active_detail = None;
         self.mode = NavigationMode::Panel;
         self.content_cursor = 0;
     }
@@ -99,6 +109,7 @@ impl App {
             self.active_panel -= 1;
         }
 
+        self.active_detail = None;
         self.mode = NavigationMode::Panel;
         self.content_cursor = 0;
     }
@@ -141,6 +152,13 @@ impl App {
     }
 
     fn escape(&mut self) {
+        if self.active_detail.is_some() {
+            self.active_detail = None;
+            self.mode = NavigationMode::View;
+            self.content_cursor = 0;
+            return;
+        }
+
         match self.mode {
             NavigationMode::Content => self.mode = NavigationMode::View,
             NavigationMode::View => self.mode = NavigationMode::Panel,
@@ -151,14 +169,29 @@ impl App {
         }
     }
 
+    fn active_path(&self) -> PathBuf {
+        self.active_detail
+            .as_ref()
+            .map(|detail| detail.path.clone())
+            .unwrap_or_else(|| self.active_view().path.clone())
+    }
+
+    fn active_title(&self) -> String {
+        self.active_detail
+            .as_ref()
+            .map(|detail| detail.title.clone())
+            .unwrap_or_else(|| self.active_view().title.clone())
+    }
+
     fn active_text(&self) -> String {
         let panel = self.active_panel();
         let view = self.active_view();
+        let path = self.active_path();
 
-        fs::read_to_string(&view.path).unwrap_or_else(|_| {
+        fs::read_to_string(&path).unwrap_or_else(|_| {
             format!(
                 "could not read {}\n\npanel: {}\nview: {}\n\nIf this is a generated view, run the relevant script first.",
-                view.path.display(),
+                path.display(),
                 panel.id,
                 view.id,
             )
@@ -166,6 +199,10 @@ impl App {
     }
 
     fn content_items(&self) -> Vec<ContentItem> {
+        if self.active_detail.is_some() {
+            return Vec::new();
+        }
+
         content_items_from_text(&self.active_text())
     }
 
@@ -194,6 +231,10 @@ impl App {
     }
 
     fn open_selected_content_item(&mut self) {
+        self.open_selected_content_item_with_data_home(alpnest_data_home());
+    }
+
+    fn open_selected_content_item_with_data_home(&mut self, data_home: PathBuf) {
         let Some(item) = self.content_items().get(self.content_cursor).cloned() else {
             return;
         };
@@ -204,17 +245,16 @@ impl App {
             return;
         }
 
-        if let Some(path) = detail_path_for(self.active_panel().id.as_str(), item.slug.as_str()) {
-            let title = item.label.clone();
-            let view = ViewConfig {
-                id: item.slug.clone(),
-                title,
+        if let Some(path) = detail_path_for_data_home(
+            data_home,
+            self.active_panel().id.as_str(),
+            item.slug.as_str(),
+        ) {
+            self.active_detail = Some(DetailView {
+                title: item.label.clone(),
                 path,
-            };
-            let panel_index = self.active_panel;
-            self.panels[panel_index].views.push(view);
-            self.set_active_view(self.panels[panel_index].views.len() - 1);
-            self.mode = NavigationMode::Content;
+            });
+            self.content_cursor = 0;
         }
     }
 
@@ -278,7 +318,7 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let panel = self.active_panel();
-        let view = self.active_view();
+        let title = self.active_title();
 
         let title = Line::from(vec![
             Span::styled(
@@ -293,7 +333,7 @@ impl App {
                 Style::default().fg(Color::LightMagenta),
             ),
             Span::raw(" / "),
-            Span::styled(view.title.as_str(), Style::default().fg(Color::Gray)),
+            Span::styled(title, Style::default().fg(Color::Gray)),
         ]);
 
         let header = Paragraph::new(title)
@@ -330,6 +370,7 @@ impl App {
                 && matches!(self.mode, NavigationMode::View | NavigationMode::Content)
             {
                 for (view_index, view) in panel.views.iter().enumerate() {
+                    let view_title = sidebar_view_title(panel.id.as_str(), view);
                     let view_marker = if view_index == self.active_view_index() {
                         ">"
                     } else {
@@ -347,7 +388,7 @@ impl App {
                         Span::raw("   "),
                         Span::styled(view_marker, view_style),
                         Span::raw(" "),
-                        Span::styled(view.title.as_str(), view_style),
+                        Span::styled(view_title, view_style),
                     ]));
                 }
             }
@@ -368,16 +409,16 @@ impl App {
 
     fn draw_focus(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let panel = self.active_panel();
-        let view = self.active_view();
 
         let text = self.active_text();
 
-        let title = format!(" {} / {} ", panel.title, view.title);
-        let selected_content = if self.mode == NavigationMode::Content {
-            Some(self.content_cursor)
-        } else {
-            None
-        };
+        let title = format!(" {} / {} ", panel.title, self.active_title());
+        let selected_content =
+            if self.mode == NavigationMode::Content && self.active_detail.is_none() {
+                Some(self.content_cursor)
+            } else {
+                None
+            };
         let lines = styled_content_lines(&text, selected_content);
 
         let widget = Paragraph::new(lines)
@@ -436,17 +477,33 @@ struct ContentItem {
 fn content_items_from_text(text: &str) -> Vec<ContentItem> {
     text.lines()
         .filter_map(|line| {
-            let cleaned = clean_display_line(line);
-            let label = content_item_label(cleaned.as_str())?;
-            let slug = slugify_context(label.as_str());
+            let item = content_item_from_line(line)?;
 
-            if slug.is_empty() {
+            if item.slug.is_empty() {
                 return None;
             }
 
-            Some(ContentItem { label, slug })
+            Some(item)
         })
         .collect()
+}
+
+fn content_item_from_line(line: &str) -> Option<ContentItem> {
+    let trimmed = line.trim();
+
+    if trimmed.starts_with("tags:") || trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(item) = mail_slot_item_from_line(trimmed) {
+        return Some(item);
+    }
+
+    let label = content_item_label(trimmed)?;
+    let explicit_slug = trailing_mail_slot_label(trimmed);
+    let slug = explicit_slug.unwrap_or_else(|| slugify_context(label.as_str()));
+
+    Some(ContentItem { label, slug })
 }
 
 fn content_item_label(line: &str) -> Option<String> {
@@ -460,18 +517,21 @@ fn content_item_label(line: &str) -> Option<String> {
         return Some(compact_content_label(rest));
     }
 
-    if let Some(rest) = trimmed.strip_prefix("## ") {
-        return Some(compact_content_label(rest));
-    }
-
     None
 }
 
 fn compact_content_label(text: &str) -> String {
-    let mut value = text.trim().to_string();
+    let without_hidden_slug = strip_trailing_mail_slot_label(text.trim());
+    let mut value = strip_mail_slot_prefix(without_hidden_slug);
 
     if let Some((_, after_date)) = value.split_once(" · ") {
         value = after_date.trim().to_string();
+    }
+
+    if let Some((_, after_slot)) = value.split_once(" | ") {
+        if is_mail_slot_id(value.split_once(" | ").map(|(slot, _)| slot).unwrap_or("")) {
+            value = after_slot.trim().to_string();
+        }
     }
 
     if let Some((before_colon, _)) = value.split_once(':') {
@@ -486,7 +546,79 @@ fn compact_content_label(text: &str) -> String {
 }
 
 fn is_content_item_line(line: &str) -> bool {
-    content_item_label(line).is_some()
+    content_item_from_line(line).is_some()
+}
+
+fn mail_slot_item_from_line(line: &str) -> Option<ContentItem> {
+    let rest = line.strip_prefix("- ")?;
+
+    if let Some(slot_id) = trailing_mail_slot_label(line) {
+        return Some(ContentItem {
+            label: compact_content_label(rest),
+            slug: slot_id,
+        });
+    }
+
+    let (candidate, label) = rest.split_once(" | ")?;
+    let candidate = candidate.trim();
+
+    if is_mail_slot_id(candidate) {
+        Some(ContentItem {
+            label: label.trim().to_string(),
+            slug: candidate.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn strip_mail_slot_prefix(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("- ") else {
+        return line.to_string();
+    };
+    let Some((candidate, label)) = rest.split_once(" | ") else {
+        return line.to_string();
+    };
+
+    if is_mail_slot_id(candidate.trim()) {
+        format!("- {}", label.trim())
+    } else {
+        line.to_string()
+    }
+}
+
+fn trailing_mail_slot_label(line: &str) -> Option<String> {
+    let label = line.trim_end().rsplit_once('[')?.1.strip_suffix(']')?;
+    if is_mail_slot_id(label) {
+        Some(label.to_string())
+    } else {
+        None
+    }
+}
+
+fn strip_trailing_mail_slot_label(line: &str) -> &str {
+    let trimmed = line.trim_end();
+    let Some((before, label_with_close)) = trimmed.rsplit_once('[') else {
+        return trimmed;
+    };
+    let Some(label) = label_with_close.strip_suffix(']') else {
+        return trimmed;
+    };
+
+    if is_mail_slot_id(label) {
+        before.trim_end()
+    } else {
+        trimmed
+    }
+}
+
+fn is_mail_slot_id(value: &str) -> bool {
+    let number = value
+        .strip_prefix("mail")
+        .or_else(|| value.strip_prefix("kit"))
+        .or_else(|| value.strip_prefix("gmail"));
+
+    number.is_some_and(|number| !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn slugify_context(value: &str) -> String {
@@ -506,25 +638,31 @@ fn slugify_context(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-fn detail_path_for(panel_id: &str, slug: &str) -> Option<PathBuf> {
-    let generated = alpnest_data_home()
-        .join("generated")
-        .join(panel_id)
-        .join(format!("{slug}.md"));
+fn detail_path_for_data_home(data_home: PathBuf, panel_id: &str, slug: &str) -> Option<PathBuf> {
+    detail_path_candidates(data_home, panel_id, slug)
+        .into_iter()
+        .find(|path| path.exists())
+}
 
-    if generated.exists() {
-        return Some(generated);
-    }
+fn detail_path_candidates(data_home: PathBuf, panel_id: &str, slug: &str) -> Vec<PathBuf> {
+    let generated = data_home.join("generated").join(panel_id);
+    let projection_dir = if slug.starts_with("mail") {
+        "feed"
+    } else if slug.starts_with("kit") {
+        "kit"
+    } else if slug.starts_with("gmail") {
+        "gmail"
+    } else {
+        "feed"
+    };
 
-    let fallback = PathBuf::from("data")
-        .join(panel_id)
-        .join(format!("{slug}.md"));
-
-    if fallback.exists() {
-        return Some(fallback);
-    }
-
-    None
+    vec![
+        generated.join(projection_dir).join(format!("{slug}.md")),
+        generated.join(format!("{slug}.md")),
+        PathBuf::from("data")
+            .join(panel_id)
+            .join(format!("{slug}.md")),
+    ]
 }
 
 fn styled_content_lines(text: &str, selected_content: Option<usize>) -> Vec<Line<'static>> {
@@ -571,7 +709,8 @@ fn styled_content_lines(text: &str, selected_content: Option<usize>) -> Vec<Line
 }
 
 fn clean_display_line(line: &str) -> String {
-    line.replace(" (unknown)", "")
+    strip_mail_slot_prefix(strip_trailing_mail_slot_label(line).trim_end())
+        .replace(" (unknown)", "")
         .replace("(unknown)", "")
         .trim_end()
         .to_string()
@@ -844,7 +983,7 @@ fn default_panels() -> Vec<PanelConfig> {
                 ViewConfig {
                     id: "overview".to_string(),
                     title: "overview".to_string(),
-                    path: generated_path("mail.md", "data/mail.md"),
+                    path: generated_path("mail_feed.md", "data/mail.md"),
                 },
                 ViewConfig {
                     id: "kit".to_string(),
@@ -859,6 +998,19 @@ fn default_panels() -> Vec<PanelConfig> {
             ],
         },
     ]
+}
+
+fn sidebar_view_title<'a>(panel_id: &str, view: &'a ViewConfig) -> &'a str {
+    if panel_id == "mail" {
+        match view.id.as_str() {
+            "overview" => "overview",
+            "kit" => "KIT",
+            "gmail" => "Gmail",
+            _ => view.title.as_str(),
+        }
+    } else {
+        view.title.as_str()
+    }
 }
 
 fn generated_path(name: &str, fallback: &str) -> PathBuf {
@@ -913,4 +1065,228 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mail0_slot_slug_and_label() {
+        let item = content_item_from_line(
+            "- Wednesday, 27. May 2026 at 21:49:48 · START Munich: Registration pending approval [mail0]",
+        )
+        .expect("mail0 feed line should be selectable");
+
+        assert_eq!(item.slug, "mail0");
+        assert_eq!(item.label, "START Munich");
+        assert!(!item.label.contains("mail0"));
+    }
+
+    #[test]
+    fn parses_mail10_as_distinct_from_mail1() {
+        let mail1 = content_item_from_line("- mail1 | **Sender**: one").unwrap();
+        let mail10 = content_item_from_line("- mail10 | **Sender**: ten").unwrap();
+        let kit10 = content_item_from_line("- kit10 | **KIT Sender**: ten").unwrap();
+        let gmail19 = content_item_from_line("- gmail19 | **Gmail Sender**: nineteen").unwrap();
+        let hidden_mail10 = content_item_from_line("- Friday · Sender: ten [mail10]").unwrap();
+        let hidden_gmail19 =
+            content_item_from_line("- Friday · Sender: nineteen [gmail19]").unwrap();
+
+        assert_eq!(mail1.slug, "mail1");
+        assert_eq!(mail10.slug, "mail10");
+        assert_eq!(kit10.slug, "kit10");
+        assert_eq!(gmail19.slug, "gmail19");
+        assert_eq!(hidden_mail10.slug, "mail10");
+        assert_eq!(hidden_gmail19.slug, "gmail19");
+        assert_eq!(mail10.label, "**Sender**: ten");
+        assert!(!mail10.label.contains("mail10 |"));
+    }
+
+    #[test]
+    fn hides_trailing_navigation_slot_labels() {
+        let line = "- Something readable [mail19]";
+        let item = content_item_from_line(line).expect("hidden slot label should be selectable");
+
+        assert_eq!(item.slug, "mail19");
+        assert_eq!(clean_display_line(line), "- Something readable");
+    }
+
+    #[test]
+    fn hides_mail_slot_prefix_from_display() {
+        let line = "- mail10 | Wednesday · START Munich: Open Registration";
+
+        assert_eq!(
+            clean_display_line(line),
+            "- Wednesday · START Munich: Open Registration"
+        );
+
+        assert_eq!(
+            clean_display_line("- kit10 | Wednesday · KIT: Example"),
+            "- Wednesday · KIT: Example"
+        );
+        assert_eq!(
+            clean_display_line("- gmail10 | Wednesday · Gmail: Example"),
+            "- Wednesday · Gmail: Example"
+        );
+        assert_eq!(
+            clean_display_line("- Wednesday · Sender: Subject [mail10]"),
+            "- Wednesday · Sender: Subject"
+        );
+    }
+
+    #[test]
+    fn mail_detail_candidates_check_feed_directory_first() {
+        let candidates = detail_path_candidates(alpnest_data_home(), "mail", "mail10");
+
+        assert!(candidates[0].ends_with("generated/mail/feed/mail10.md"));
+        assert!(candidates[1].ends_with("generated/mail/mail10.md"));
+        assert!(candidates[2].ends_with("data/mail/mail10.md"));
+
+        let kit_candidates = detail_path_candidates(alpnest_data_home(), "mail", "kit10");
+        assert!(kit_candidates[0].ends_with("generated/mail/kit/kit10.md"));
+
+        let gmail_candidates = detail_path_candidates(alpnest_data_home(), "mail", "gmail10");
+        assert!(gmail_candidates[0].ends_with("generated/mail/gmail/gmail10.md"));
+    }
+
+    #[test]
+    fn mail_detail_path_resolves_existing_feed_file() {
+        let data_home = std::env::temp_dir().join(format!(
+            "alpnest-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let detail_path = data_home
+            .join("generated")
+            .join("mail")
+            .join("feed")
+            .join("mail10.md");
+
+        std::fs::create_dir_all(detail_path.parent().unwrap()).unwrap();
+        std::fs::write(&detail_path, "# test\n").unwrap();
+
+        assert_eq!(
+            detail_path_for_data_home(data_home, "mail", "mail10"),
+            Some(detail_path)
+        );
+    }
+
+    #[test]
+    fn mail_panel_exposes_overview_kit_and_gmail_views() {
+        let mail_panel = default_panels()
+            .into_iter()
+            .find(|panel| panel.id == "mail")
+            .expect("mail panel should exist");
+
+        assert_eq!(mail_panel.views.len(), 3);
+        assert_eq!(mail_panel.views[0].id, "overview");
+        assert_eq!(mail_panel.views[0].title, "overview");
+        assert_eq!(mail_panel.views[1].id, "kit");
+        assert_eq!(mail_panel.views[1].title, "KIT");
+        assert_eq!(mail_panel.views[2].id, "gmail");
+        assert_eq!(mail_panel.views[2].title, "Gmail");
+    }
+
+    #[test]
+    fn opening_mail_detail_sets_active_detail_without_mutating_stable_view() {
+        let data_home = std::env::temp_dir().join(format!(
+            "alpnest-open-detail-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let detail_path = data_home
+            .join("generated")
+            .join("mail")
+            .join("feed")
+            .join("mail10.md");
+        std::fs::create_dir_all(detail_path.parent().unwrap()).unwrap();
+        std::fs::write(&detail_path, "# Subject\n\n## summary\n\nReadable detail.").unwrap();
+
+        let overview_path = data_home.join("mail_feed.md");
+        std::fs::write(
+            &overview_path,
+            "# mail\n\n- mail10 | Friday · Sender: Subject (admin, unread)\n  Summary preview.\n",
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.active_panel = app
+            .panels
+            .iter()
+            .position(|panel| panel.id == "mail")
+            .expect("mail panel should exist");
+        app.mode = NavigationMode::Content;
+        let mail_view = &mut app.panels[app.active_panel].views[0];
+        mail_view.path = overview_path.clone();
+        let stable_title = mail_view.title.clone();
+        let stable_path = mail_view.path.clone();
+
+        app.open_selected_content_item_with_data_home(data_home);
+
+        let detail = app
+            .active_detail
+            .as_ref()
+            .expect("opening mail should create transient detail");
+        assert_eq!(detail.path, detail_path);
+        assert_eq!(app.panels[app.active_panel].views[0].title, stable_title);
+        assert_eq!(app.panels[app.active_panel].views[0].path, stable_path);
+    }
+
+    #[test]
+    fn escape_clears_active_detail_and_returns_to_stable_mail_view() {
+        let mut app = App::new();
+        app.active_panel = app
+            .panels
+            .iter()
+            .position(|panel| panel.id == "mail")
+            .expect("mail panel should exist");
+        app.mode = NavigationMode::Content;
+        app.active_detail = Some(DetailView {
+            title: "A selected message".to_string(),
+            path: PathBuf::from("generated/mail/feed/mail10.md"),
+        });
+
+        app.escape();
+
+        assert!(app.active_detail.is_none());
+        assert_eq!(app.mode, NavigationMode::View);
+        assert_eq!(app.active_title(), "overview");
+        assert_eq!(app.active_view().title, "overview");
+    }
+
+    #[test]
+    fn opened_mail_detail_headings_are_not_selectable_content() {
+        let detail_path = std::env::temp_dir().join(format!(
+            "alpnest-mail-detail-test-{}.md",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &detail_path,
+            "# Subject\n\n## summary\n\nShort version.\n\n## message 1\n\nFull body.",
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.active_panel = app
+            .panels
+            .iter()
+            .position(|panel| panel.id == "mail")
+            .expect("mail panel should exist");
+        app.active_detail = Some(DetailView {
+            title: "A selected message".to_string(),
+            path: detail_path,
+        });
+
+        assert!(app.content_items().is_empty());
+        assert!(content_item_from_line("## summary").is_none());
+        assert!(content_item_from_line("## message").is_none());
+    }
 }
