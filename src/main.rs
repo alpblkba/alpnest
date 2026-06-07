@@ -115,30 +115,51 @@ impl App {
     }
 
     fn next_view(&mut self) {
-        let len = self.active_panel().views.len();
-        if len <= 1 {
-            return;
-        }
-
-        let next = (self.active_view_index() + 1) % len;
-        self.set_active_view(next);
-    }
-
-    fn previous_view(&mut self) {
-        let len = self.active_panel().views.len();
-        if len <= 1 {
+        let scope = self.view_navigation_scope();
+        if scope.len() <= 1 {
             return;
         }
 
         let current = self.active_view_index();
-        let previous = if current == 0 { len - 1 } else { current - 1 };
-        self.set_active_view(previous);
+        let current_pos = scope
+            .iter()
+            .position(|index| *index == current)
+            .unwrap_or(0);
+        let next = scope[(current_pos + 1) % scope.len()];
+        self.set_active_view(next);
+    }
+
+    fn previous_view(&mut self) {
+        let scope = self.view_navigation_scope();
+        if scope.len() <= 1 {
+            return;
+        }
+
+        let current = self.active_view_index();
+        let current_pos = scope
+            .iter()
+            .position(|index| *index == current)
+            .unwrap_or(0);
+        let previous_pos = if current_pos == 0 {
+            scope.len() - 1
+        } else {
+            current_pos - 1
+        };
+        self.set_active_view(scope[previous_pos]);
     }
 
     fn enter(&mut self) {
         match self.mode {
             NavigationMode::Panel => self.mode = NavigationMode::View,
             NavigationMode::View => {
+                if let Some(child_index) =
+                    self.first_child_view_index(self.active_view().id.as_str())
+                {
+                    self.set_active_view(child_index);
+                    self.mode = NavigationMode::View;
+                    return;
+                }
+
                 self.mode = NavigationMode::Content;
                 let item_count = self.content_items().len();
                 self.content_cursor = if item_count == 0 {
@@ -161,7 +182,13 @@ impl App {
 
         match self.mode {
             NavigationMode::Content => self.mode = NavigationMode::View,
-            NavigationMode::View => self.mode = NavigationMode::Panel,
+            NavigationMode::View => {
+                if let Some(parent_index) = self.active_view_parent_index() {
+                    self.set_active_view(parent_index);
+                } else {
+                    self.mode = NavigationMode::Panel;
+                }
+            }
             NavigationMode::Panel => {
                 self.mode = NavigationMode::Panel;
                 self.set_active_view(0);
@@ -245,9 +272,10 @@ impl App {
             return;
         }
 
-        if let Some(path) = detail_path_for_data_home(
+        if let Some(path) = detail_path_for_context(
             data_home,
             self.active_panel().id.as_str(),
+            &self.active_path(),
             item.slug.as_str(),
         ) {
             self.active_detail = Some(DetailView {
@@ -263,6 +291,94 @@ impl App {
             slugify_context(view.id.as_str()) == slug
                 || slugify_context(view.title.as_str()) == slug
         })
+    }
+
+    fn first_child_view_index(&self, parent_id: &str) -> Option<usize> {
+        let prefix = format!("{parent_id}-");
+
+        self.active_panel()
+            .views
+            .iter()
+            .position(|view| view.id.starts_with(&prefix))
+    }
+
+    fn active_view_parent_index(&self) -> Option<usize> {
+        self.view_parent_index(self.active_view_index())
+    }
+
+    fn view_parent_index(&self, view_index: usize) -> Option<usize> {
+        let view_id = self.active_panel().views.get(view_index)?.id.as_str();
+
+        self.active_panel()
+            .views
+            .iter()
+            .enumerate()
+            .filter(|(index, parent)| {
+                *index != view_index && view_id.starts_with(format!("{}-", parent.id).as_str())
+            })
+            .max_by_key(|(_, parent)| parent.id.len())
+            .map(|(index, _)| index)
+    }
+
+    fn child_view_indices(&self, parent_index: usize) -> Vec<usize> {
+        let Some(parent) = self.active_panel().views.get(parent_index) else {
+            return Vec::new();
+        };
+
+        let prefix = format!("{}-", parent.id);
+
+        self.active_panel()
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(index, view)| {
+                if view.id.starts_with(&prefix) {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn top_level_view_indices(&self) -> Vec<usize> {
+        self.active_panel()
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                if self.view_parent_index(index).is_none() {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn view_navigation_scope(&self) -> Vec<usize> {
+        if let Some(parent_index) = self.active_view_parent_index() {
+            return self.child_view_indices(parent_index);
+        }
+
+        self.top_level_view_indices()
+    }
+
+    fn should_show_view_in_sidebar(&self, view_index: usize) -> bool {
+        let Some(parent_index) = self.view_parent_index(view_index) else {
+            return true;
+        };
+
+        let active_index = self.active_view_index();
+        active_index == parent_index || self.view_parent_index(active_index) == Some(parent_index)
+    }
+
+    fn sidebar_view_indent(&self, view_index: usize) -> &'static str {
+        if self.view_parent_index(view_index).is_some() {
+            "      "
+        } else {
+            "   "
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -379,6 +495,10 @@ impl App {
                 && matches!(self.mode, NavigationMode::View | NavigationMode::Content)
             {
                 for (view_index, view) in panel.views.iter().enumerate() {
+                    if !self.should_show_view_in_sidebar(view_index) {
+                        continue;
+                    }
+
                     let view_title = sidebar_view_title(panel.id.as_str(), view);
                     let view_marker = if view_index == self.active_view_index() {
                         ">"
@@ -394,7 +514,7 @@ impl App {
                     };
 
                     lines.push(Line::from(vec![
-                        Span::raw("   "),
+                        Span::raw(self.sidebar_view_indent(view_index)),
                         Span::styled(view_marker, view_style),
                         Span::raw(" "),
                         Span::styled(view_title, view_style),
@@ -667,13 +787,35 @@ fn slugify_context(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+#[cfg(test)]
 fn detail_path_for_data_home(data_home: PathBuf, panel_id: &str, slug: &str) -> Option<PathBuf> {
     detail_path_candidates(data_home, panel_id, slug)
         .into_iter()
         .find(|path| path.exists())
 }
 
+fn detail_path_for_context(
+    data_home: PathBuf,
+    panel_id: &str,
+    active_path: &std::path::Path,
+    slug: &str,
+) -> Option<PathBuf> {
+    detail_path_candidates_for_context(data_home, panel_id, active_path, slug)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+#[cfg(test)]
 fn detail_path_candidates(data_home: PathBuf, panel_id: &str, slug: &str) -> Vec<PathBuf> {
+    detail_path_candidates_for_context(data_home, panel_id, std::path::Path::new(""), slug)
+}
+
+fn detail_path_candidates_for_context(
+    data_home: PathBuf,
+    panel_id: &str,
+    active_path: &std::path::Path,
+    slug: &str,
+) -> Vec<PathBuf> {
     let generated = data_home.join("generated").join(panel_id);
     let projection_dir = if slug.starts_with("mail") {
         "feed"
@@ -685,9 +827,18 @@ fn detail_path_candidates(data_home: PathBuf, panel_id: &str, slug: &str) -> Vec
         "feed"
     };
 
-    vec![
+    let mut candidates = vec![
         generated.join(projection_dir).join(format!("{slug}.md")),
         generated.join(format!("{slug}.md")),
+    ];
+
+    if let Some(active_dir) = active_content_dir(active_path) {
+        candidates.push(active_dir.join(slug).join("overview.md"));
+        candidates.push(active_dir.join(format!("{slug}.md")));
+        candidates.push(active_dir.join("milestones").join(format!("{slug}.md")));
+    }
+
+    candidates.extend([
         PathBuf::from("data")
             .join(panel_id)
             .join(slug)
@@ -695,7 +846,17 @@ fn detail_path_candidates(data_home: PathBuf, panel_id: &str, slug: &str) -> Vec
         PathBuf::from("data")
             .join(panel_id)
             .join(format!("{slug}.md")),
-    ]
+    ]);
+
+    candidates
+}
+
+fn active_content_dir(active_path: &std::path::Path) -> Option<PathBuf> {
+    if active_path.file_name()? == "overview.md" {
+        return active_path.parent().map(|parent| parent.to_path_buf());
+    }
+
+    None
 }
 
 fn context_path_for(path: &std::path::Path) -> Option<PathBuf> {
@@ -968,6 +1129,274 @@ fn is_label_text(text: &str) -> bool {
 }
 
 fn default_panels() -> Vec<PanelConfig> {
+    let panels = load_panels_from_registry(&PathBuf::from("data").join("panels"));
+
+    if panels.is_empty() {
+        fallback_panels()
+    } else {
+        panels
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SimpleToml {
+    id: Option<String>,
+    title: Option<String>,
+    kind: Option<String>,
+    generated: Option<String>,
+    path: Option<String>,
+    repo: Option<String>,
+    order: Option<i64>,
+}
+
+fn load_panels_from_registry(panels_root: &std::path::Path) -> Vec<PanelConfig> {
+    let mut panel_dirs = read_dirs_sorted(panels_root);
+    panel_dirs.sort_by_key(|path| {
+        let config = read_simple_toml(&path.join("panel.toml"));
+        (
+            config.order.unwrap_or_else(|| numeric_prefix_order(path)),
+            path.file_name().map(|name| name.to_os_string()),
+        )
+    });
+
+    panel_dirs
+        .into_iter()
+        .filter_map(|panel_dir| load_panel_from_dir(&panel_dir))
+        .collect()
+}
+
+fn load_panel_from_dir(panel_dir: &std::path::Path) -> Option<PanelConfig> {
+    let config = read_simple_toml(&panel_dir.join("panel.toml"));
+    let fallback_id = strip_numeric_prefix(panel_dir.file_name()?.to_string_lossy().as_ref());
+    let id = config.id.clone().unwrap_or_else(|| fallback_id.clone());
+    let title = config.title.clone().unwrap_or_else(|| title_from_slug(&id));
+
+    let overview_path = configured_path(&config, panel_dir.join("overview.md"));
+
+    let mut views = vec![ViewConfig {
+        id: "overview".to_string(),
+        title: "overview".to_string(),
+        path: overview_path,
+    }];
+
+    let mut child_views = load_child_views_from_dir(&panel_dir.join("views"));
+    views.append(&mut child_views);
+
+    Some(PanelConfig { id, title, views })
+}
+
+fn load_child_views_from_dir(views_dir: &std::path::Path) -> Vec<ViewConfig> {
+    let mut dirs = read_dirs_sorted(views_dir);
+    dirs.sort_by_key(|path| {
+        let config = read_simple_toml(&path.join("view.toml"));
+        (
+            config.order.unwrap_or_else(|| numeric_prefix_order(path)),
+            path.file_name().map(|name| name.to_os_string()),
+        )
+    });
+
+    let mut views = Vec::new();
+
+    for view_dir in dirs {
+        let Some(view_id) = view_id_from_dir(&view_dir) else {
+            continue;
+        };
+
+        let config = read_simple_toml(&view_dir.join("view.toml"));
+        let title = config
+            .title
+            .clone()
+            .unwrap_or_else(|| title_from_slug(&view_id));
+        let overview_path = configured_path(&config, view_dir.join("overview.md"));
+
+        views.push(ViewConfig {
+            id: view_id.clone(),
+            title,
+            path: overview_path.clone(),
+        });
+
+        views.push(ViewConfig {
+            id: format!("{view_id}-overview"),
+            title: "overview".to_string(),
+            path: overview_path,
+        });
+
+        for (suffix, title, file_name) in [
+            ("context", "context", "context.md"),
+            ("notes", "notes", "notes.md"),
+            ("prompt", "prompt", "prompt.md"),
+            ("git", "git", "git.md"),
+        ] {
+            let path = view_dir.join(file_name);
+            if path.exists() {
+                views.push(ViewConfig {
+                    id: format!("{view_id}-{suffix}"),
+                    title: title.to_string(),
+                    path,
+                });
+            }
+        }
+
+        let mut milestone_files = read_markdown_files_sorted(&view_dir.join("milestones"));
+        milestone_files.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
+
+        for milestone in milestone_files {
+            let Some(stem) = milestone
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+
+            views.push(ViewConfig {
+                id: format!("{view_id}-{}", slugify_context(&stem)),
+                title: stem,
+                path: milestone,
+            });
+        }
+    }
+
+    views
+}
+
+fn configured_path(config: &SimpleToml, fallback: PathBuf) -> PathBuf {
+    if let Some(generated) = config.generated.as_deref() {
+        return generated_path(generated, fallback.to_string_lossy().as_ref());
+    }
+
+    if let Some(path) = config.path.as_deref() {
+        return expand_home_path(path);
+    }
+
+    fallback
+}
+
+fn read_dirs_sorted(path: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+
+    dirs.sort();
+    dirs
+}
+
+fn read_markdown_files_sorted(path: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().is_some_and(|extension| extension == "md")
+        })
+        .collect();
+
+    files.sort();
+    files
+}
+
+fn read_simple_toml(path: &std::path::Path) -> SimpleToml {
+    let Ok(text) = fs::read_to_string(path) else {
+        return SimpleToml::default();
+    };
+
+    let mut config = SimpleToml::default();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        let key = key.trim();
+        let value = parse_simple_toml_value(value.trim());
+
+        match key {
+            "id" => config.id = Some(value),
+            "title" => config.title = Some(value),
+            "kind" => config.kind = Some(value),
+            "generated" => config.generated = Some(value),
+            "path" => config.path = Some(value),
+            "repo" => config.repo = Some(value),
+            "order" => config.order = value.parse::<i64>().ok(),
+            _ => {}
+        }
+    }
+
+    config
+}
+
+fn parse_simple_toml_value(value: &str) -> String {
+    let trimmed = value.trim();
+
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn numeric_prefix_order(path: &std::path::Path) -> i64 {
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return i64::MAX;
+    };
+
+    let Some((prefix, _)) = name.split_once('-') else {
+        return i64::MAX;
+    };
+
+    prefix.parse::<i64>().unwrap_or(i64::MAX)
+}
+
+fn strip_numeric_prefix(name: &str) -> String {
+    if let Some((prefix, rest)) = name.split_once('-') {
+        if prefix.chars().all(|ch| ch.is_ascii_digit()) {
+            return rest.to_string();
+        }
+    }
+
+    name.to_string()
+}
+
+fn view_id_from_dir(path: &std::path::Path) -> Option<String> {
+    let config = read_simple_toml(&path.join("view.toml"));
+    config.id.or_else(|| {
+        path.file_name()
+            .map(|name| strip_numeric_prefix(name.to_string_lossy().as_ref()))
+    })
+}
+
+fn title_from_slug(slug: &str) -> String {
+    slug.split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    PathBuf::from(path)
+}
+
+fn fallback_panels() -> Vec<PanelConfig> {
     vec![
         PanelConfig {
             id: "today".to_string(),
@@ -977,94 +1406,6 @@ fn default_panels() -> Vec<PanelConfig> {
                 title: "overview".to_string(),
                 path: PathBuf::from("data/today.md"),
             }],
-        },
-        PanelConfig {
-            id: "school".to_string(),
-            title: "school".to_string(),
-            views: vec![
-                ViewConfig {
-                    id: "overview".to_string(),
-                    title: "overview".to_string(),
-                    path: PathBuf::from("data/school.md"),
-                },
-                ViewConfig {
-                    id: "mmai".to_string(),
-                    title: "MMAI".to_string(),
-                    path: PathBuf::from("data/school/mmai/overview.md"),
-                },
-                ViewConfig {
-                    id: "seminar".to_string(),
-                    title: "seminar".to_string(),
-                    path: PathBuf::from("data/school/seminar/overview.md"),
-                },
-                ViewConfig {
-                    id: "iot-lab".to_string(),
-                    title: "IoT lab".to_string(),
-                    path: generated_path(
-                        "projects/iot-lab/overview.md",
-                        "data/projects/iot-lab/overview.md",
-                    ),
-                },
-                ViewConfig {
-                    id: "hardware-security".to_string(),
-                    title: "hardware security".to_string(),
-                    path: generated_path(
-                        "projects/hardware-security/overview.md",
-                        "data/projects/hardware-security/overview.md",
-                    ),
-                },
-            ],
-        },
-        PanelConfig {
-            id: "projects".to_string(),
-            title: "projects".to_string(),
-            views: vec![
-                ViewConfig {
-                    id: "overview".to_string(),
-                    title: "overview".to_string(),
-                    path: PathBuf::from("data/projects.md"),
-                },
-                ViewConfig {
-                    id: "alpnest".to_string(),
-                    title: "alpnest".to_string(),
-                    path: generated_path(
-                        "projects/alpnest/overview.md",
-                        "data/projects/alpnest/overview.md",
-                    ),
-                },
-                ViewConfig {
-                    id: "hardware-security".to_string(),
-                    title: "hardware-security".to_string(),
-                    path: generated_path(
-                        "projects/hardware-security/overview.md",
-                        "data/projects/hardware-security/overview.md",
-                    ),
-                },
-                ViewConfig {
-                    id: "iot-lab".to_string(),
-                    title: "iot-lab".to_string(),
-                    path: generated_path(
-                        "projects/iot-lab/overview.md",
-                        "data/projects/iot-lab/overview.md",
-                    ),
-                },
-                ViewConfig {
-                    id: "rv32i-mla".to_string(),
-                    title: "rv32i-mla".to_string(),
-                    path: generated_path(
-                        "projects/rv32i-mla/overview.md",
-                        "data/projects/rv32i-mla/overview.md",
-                    ),
-                },
-                ViewConfig {
-                    id: "leetcode-solutions".to_string(),
-                    title: "leetcode-solutions".to_string(),
-                    path: generated_path(
-                        "projects/leetcode-solutions/overview.md",
-                        "data/projects/leetcode-solutions/overview.md",
-                    ),
-                },
-            ],
         },
         PanelConfig {
             id: "mail".to_string(),
@@ -1084,22 +1425,6 @@ fn default_panels() -> Vec<PanelConfig> {
                     id: "gmail".to_string(),
                     title: "Gmail".to_string(),
                     path: generated_path("mail_gmail.md", "data/mail.md"),
-                },
-            ],
-        },
-        PanelConfig {
-            id: "job".to_string(),
-            title: "job".to_string(),
-            views: vec![
-                ViewConfig {
-                    id: "overview".to_string(),
-                    title: "overview".to_string(),
-                    path: PathBuf::from("data/job.md"),
-                },
-                ViewConfig {
-                    id: "hiwi".to_string(),
-                    title: "HiWi".to_string(),
-                    path: PathBuf::from("data/job/hiwi/overview.md"),
                 },
             ],
         },
@@ -1318,6 +1643,23 @@ mod tests {
         assert!(candidates[1].ends_with("generated/projects/alpnest.md"));
         assert!(candidates[2].ends_with("data/projects/alpnest/overview.md"));
         assert!(candidates[3].ends_with("data/projects/alpnest.md"));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    #[test]
+    fn context_detail_candidates_prefer_active_course_directory() {
+        let candidates = detail_path_candidates_for_context(
+            alpnest_data_home(),
+            "school",
+            std::path::Path::new("data/school/mmai/overview.md"),
+            "notes",
+        );
+
+        assert!(candidates[2].ends_with("data/school/mmai/notes/overview.md"));
+        assert!(candidates[3].ends_with("data/school/mmai/notes.md"));
+        assert!(candidates[4].ends_with("data/school/mmai/milestones/notes.md"));
+        assert!(candidates[5].ends_with("data/school/notes/overview.md"));
+        assert!(candidates[6].ends_with("data/school/notes.md"));
     }
 
     #[test]
@@ -1360,7 +1702,12 @@ mod tests {
             .find(|view| view.id == "alpnest")
             .expect("alpnest view should exist");
 
-        assert!(alpnest_view.path.ends_with("projects/alpnest/overview.md"));
+        assert!(
+            alpnest_view
+                .path
+                .ends_with("data/panels/20-projects/views/10-alpnest/overview.md")
+                || alpnest_view.path.ends_with("projects/alpnest/overview.md")
+        );
     }
 
     #[test]
@@ -1388,19 +1735,135 @@ mod tests {
     }
 
     #[test]
+    fn school_panel_exposes_mmai_course_subviews() {
+        let school_panel = default_panels()
+            .into_iter()
+            .find(|panel| panel.id == "school")
+            .expect("school panel should exist");
+
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/overview.md")
+                    || view.path.ends_with("data/school/mmai/overview.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-notes"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/notes.md")
+                    || view.path.ends_with("data/school/mmai/notes.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-prompt"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/prompt.md")
+                    || view.path.ends_with("data/school/mmai/prompt.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-ms0"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/milestones/ms0.md")
+                    || view.path.ends_with("data/school/mmai/milestones/ms0.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-2026-06-07-bridging-day"
+                && (view.path.ends_with(
+                    "data/panels/10-school/views/16-mmai/milestones/2026-06-07-bridging-day.md",
+                ) || view
+                    .path
+                    .ends_with("data/school/mmai/milestones/2026-06-07-bridging-day.md"))
+        }));
+    }
+
+    #[test]
+    fn school_panel_exposes_mmai_course_group_and_child_views() {
+        let school_panel = default_panels()
+            .into_iter()
+            .find(|panel| panel.id == "school")
+            .expect("school panel should exist");
+
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/overview.md")
+                    || view.path.ends_with("data/school/mmai/overview.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-overview"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/overview.md")
+                    || view.path.ends_with("data/school/mmai/overview.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-context"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/context.md")
+                    || view.path.ends_with("data/school/mmai/context.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-notes"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/notes.md")
+                    || view.path.ends_with("data/school/mmai/notes.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-prompt"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/prompt.md")
+                    || view.path.ends_with("data/school/mmai/prompt.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-ms0"
+                && (view
+                    .path
+                    .ends_with("data/panels/10-school/views/16-mmai/milestones/ms0.md")
+                    || view.path.ends_with("data/school/mmai/milestones/ms0.md"))
+        }));
+        assert!(school_panel.views.iter().any(|view| {
+            view.id == "mmai-2026-06-07-bridging-day"
+                && (view.path.ends_with(
+                    "data/panels/10-school/views/16-mmai/milestones/2026-06-07-bridging-day.md",
+                ) || view
+                    .path
+                    .ends_with("data/school/mmai/milestones/2026-06-07-bridging-day.md"))
+        }));
+    }
+
+    #[test]
     fn mail_panel_exposes_overview_kit_and_gmail_views() {
         let mail_panel = default_panels()
             .into_iter()
             .find(|panel| panel.id == "mail")
             .expect("mail panel should exist");
 
-        assert_eq!(mail_panel.views.len(), 3);
-        assert_eq!(mail_panel.views[0].id, "overview");
-        assert_eq!(mail_panel.views[0].title, "overview");
-        assert_eq!(mail_panel.views[1].id, "kit");
-        assert_eq!(mail_panel.views[1].title, "KIT");
-        assert_eq!(mail_panel.views[2].id, "gmail");
-        assert_eq!(mail_panel.views[2].title, "Gmail");
+        assert!(mail_panel.views.len() >= 3);
+        assert!(
+            mail_panel
+                .views
+                .iter()
+                .any(|view| view.id == "overview" && view.title == "overview")
+        );
+        assert!(
+            mail_panel
+                .views
+                .iter()
+                .any(|view| view.id == "kit" && view.title == "KIT")
+        );
+        assert!(
+            mail_panel
+                .views
+                .iter()
+                .any(|view| view.id == "gmail" && view.title == "Gmail")
+        );
     }
 
     #[test]
