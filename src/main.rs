@@ -1,4 +1,4 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{env, fs, io, path::PathBuf, process::Command};
 
 use color_eyre::Result;
 use crossterm::{
@@ -300,20 +300,29 @@ impl App {
             ])
             .split(frame.area());
 
+        self.draw_header(frame, root[0]);
+        self.draw_body(frame, root[1]);
+        self.draw_footer(frame, root[2]);
+    }
+
+    fn draw_body(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        self.draw_fixed_body(frame, area);
+    }
+
+    fn draw_fixed_body(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(24),
-                Constraint::Min(40),
-                Constraint::Length(36),
-            ])
-            .split(root[1]);
+            .constraints([Constraint::Length(30), Constraint::Min(50)])
+            .split(area);
 
-        self.draw_header(frame, root[0]);
-        self.draw_panels(frame, body[0]);
+        let left_stack = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body[0]);
+
+        self.draw_panels(frame, left_stack[0]);
+        self.draw_context(frame, left_stack[1]);
         self.draw_focus(frame, body[1]);
-        self.draw_context(frame, body[2]);
-        self.draw_footer(frame, root[2]);
     }
 
     fn draw_header(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -429,22 +438,42 @@ impl App {
     }
 
     fn draw_context(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let text = self.active_context_text();
+
+        let widget = Paragraph::new(styled_content_lines(&text, None))
+            .block(Block::default().borders(Borders::ALL).title(" context "))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(widget, area);
+    }
+
+    fn active_context_text(&self) -> String {
+        if let Some(path) = self.active_context_path() {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if !text.trim().is_empty() {
+                    return text;
+                }
+            }
+        }
+
+        self.fallback_context_text()
+    }
+
+    fn active_context_path(&self) -> Option<PathBuf> {
+        context_path_for(&self.active_path())
+    }
+
+    fn fallback_context_text(&self) -> String {
         let mode = match self.mode {
             NavigationMode::Panel => "panel mode",
             NavigationMode::View => "view mode",
             NavigationMode::Content => "content mode",
         };
 
-        let text = format!(
-            "context\n\nmode: {}\n\nalpnest is not a code editor.\n\nit is the home screen before the work starts.\n\nnext layers:\n- real TODO files\n- calendar snapshot\n- project scanner\n- mail summary\n- zellij layout",
+        format!(
+            "# context\n\nmode: {}\n\nNo context file was found for this view yet.\n\nExpected sibling examples:\n- context.md next to project overview files\n- *.context.md next to flat data files\n\nnext layers:\n- project scanner\n- generated git snapshots\n- zellij layout\n- calendar snapshot",
             mode
-        );
-
-        let widget = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(" context "))
-            .wrap(Wrap { trim: false });
-
-        frame.render_widget(widget, area);
+        )
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -661,8 +690,32 @@ fn detail_path_candidates(data_home: PathBuf, panel_id: &str, slug: &str) -> Vec
         generated.join(format!("{slug}.md")),
         PathBuf::from("data")
             .join(panel_id)
+            .join(slug)
+            .join("overview.md"),
+        PathBuf::from("data")
+            .join(panel_id)
             .join(format!("{slug}.md")),
     ]
+}
+
+fn context_path_for(path: &std::path::Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let parent = path.parent()?;
+
+    if file_name == "overview.md" {
+        let candidate = parent.join("context.md");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let stem = path.file_stem()?.to_string_lossy();
+    let candidate = parent.join(format!("{stem}.context.md"));
+    if candidate.exists() {
+        return Some(candidate);
+    }
+
+    None
 }
 
 fn styled_content_lines(text: &str, selected_content: Option<usize>) -> Vec<Line<'static>> {
@@ -928,11 +981,39 @@ fn default_panels() -> Vec<PanelConfig> {
         PanelConfig {
             id: "school".to_string(),
             title: "school".to_string(),
-            views: vec![ViewConfig {
-                id: "overview".to_string(),
-                title: "overview".to_string(),
-                path: PathBuf::from("data/school.md"),
-            }],
+            views: vec![
+                ViewConfig {
+                    id: "overview".to_string(),
+                    title: "overview".to_string(),
+                    path: PathBuf::from("data/school.md"),
+                },
+                ViewConfig {
+                    id: "mmai".to_string(),
+                    title: "MMAI".to_string(),
+                    path: PathBuf::from("data/school/mmai/overview.md"),
+                },
+                ViewConfig {
+                    id: "seminar".to_string(),
+                    title: "seminar".to_string(),
+                    path: PathBuf::from("data/school/seminar/overview.md"),
+                },
+                ViewConfig {
+                    id: "iot-lab".to_string(),
+                    title: "IoT lab".to_string(),
+                    path: generated_path(
+                        "projects/iot-lab/overview.md",
+                        "data/projects/iot-lab/overview.md",
+                    ),
+                },
+                ViewConfig {
+                    id: "hardware-security".to_string(),
+                    title: "hardware security".to_string(),
+                    path: generated_path(
+                        "projects/hardware-security/overview.md",
+                        "data/projects/hardware-security/overview.md",
+                    ),
+                },
+            ],
         },
         PanelConfig {
             id: "projects".to_string(),
@@ -946,32 +1027,41 @@ fn default_panels() -> Vec<PanelConfig> {
                 ViewConfig {
                     id: "alpnest".to_string(),
                     title: "alpnest".to_string(),
-                    path: generated_path("projects/alpnest.md", "data/projects/alpnest.md"),
+                    path: generated_path(
+                        "projects/alpnest/overview.md",
+                        "data/projects/alpnest/overview.md",
+                    ),
                 },
                 ViewConfig {
                     id: "hardware-security".to_string(),
                     title: "hardware-security".to_string(),
                     path: generated_path(
-                        "projects/hardware-security.md",
-                        "data/projects/hardware-security.md",
+                        "projects/hardware-security/overview.md",
+                        "data/projects/hardware-security/overview.md",
                     ),
                 },
                 ViewConfig {
                     id: "iot-lab".to_string(),
                     title: "iot-lab".to_string(),
-                    path: generated_path("projects/iot-lab.md", "data/projects/iot-lab.md"),
+                    path: generated_path(
+                        "projects/iot-lab/overview.md",
+                        "data/projects/iot-lab/overview.md",
+                    ),
                 },
                 ViewConfig {
                     id: "rv32i-mla".to_string(),
                     title: "rv32i-mla".to_string(),
-                    path: generated_path("projects/rv32i-mla.md", "data/projects/rv32i-mla.md"),
+                    path: generated_path(
+                        "projects/rv32i-mla/overview.md",
+                        "data/projects/rv32i-mla/overview.md",
+                    ),
                 },
                 ViewConfig {
                     id: "leetcode-solutions".to_string(),
                     title: "leetcode-solutions".to_string(),
                     path: generated_path(
-                        "projects/leetcode-solutions.md",
-                        "data/projects/leetcode-solutions.md",
+                        "projects/leetcode-solutions/overview.md",
+                        "data/projects/leetcode-solutions/overview.md",
                     ),
                 },
             ],
@@ -994,6 +1084,22 @@ fn default_panels() -> Vec<PanelConfig> {
                     id: "gmail".to_string(),
                     title: "Gmail".to_string(),
                     path: generated_path("mail_gmail.md", "data/mail.md"),
+                },
+            ],
+        },
+        PanelConfig {
+            id: "job".to_string(),
+            title: "job".to_string(),
+            views: vec![
+                ViewConfig {
+                    id: "overview".to_string(),
+                    title: "overview".to_string(),
+                    path: PathBuf::from("data/job.md"),
+                },
+                ViewConfig {
+                    id: "hiwi".to_string(),
+                    title: "HiWi".to_string(),
+                    path: PathBuf::from("data/job/hiwi/overview.md"),
                 },
             ],
         },
@@ -1048,8 +1154,61 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     Ok(())
 }
 
+fn should_launch_session() -> bool {
+    env::var_os("ALPNEST_NO_SESSION").is_none()
+        && env::var_os("ZELLIJ").is_none()
+        && env::var_os("TMUX").is_none()
+}
+
+fn session_launcher_path() -> Option<PathBuf> {
+    let cwd_launcher = env::current_dir()
+        .ok()
+        .map(|path| path.join("scripts").join("alpnest-session.sh"));
+
+    if let Some(path) = cwd_launcher {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let home = env::var("HOME").ok()?;
+    let repo_launcher = PathBuf::from(home)
+        .join("Documents")
+        .join("GitHub")
+        .join("alpnest")
+        .join("scripts")
+        .join("alpnest-session.sh");
+
+    if repo_launcher.exists() {
+        Some(repo_launcher)
+    } else {
+        None
+    }
+}
+
+fn launch_session_if_needed() -> Result<bool> {
+    if !should_launch_session() {
+        return Ok(false);
+    }
+
+    let Some(launcher) = session_launcher_path() else {
+        return Ok(false);
+    };
+
+    let current_exe = env::current_exe()?;
+    let status = Command::new(launcher)
+        .env("ALPNEST_COMMAND", current_exe)
+        .status()?;
+
+    Ok(status.success())
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
+
+    if launch_session_if_needed()? {
+        return Ok(());
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1141,13 +1300,67 @@ mod tests {
 
         assert!(candidates[0].ends_with("generated/mail/feed/mail10.md"));
         assert!(candidates[1].ends_with("generated/mail/mail10.md"));
-        assert!(candidates[2].ends_with("data/mail/mail10.md"));
+        assert!(candidates[2].ends_with("data/mail/mail10/overview.md"));
+        assert!(candidates[3].ends_with("data/mail/mail10.md"));
 
         let kit_candidates = detail_path_candidates(alpnest_data_home(), "mail", "kit10");
         assert!(kit_candidates[0].ends_with("generated/mail/kit/kit10.md"));
 
         let gmail_candidates = detail_path_candidates(alpnest_data_home(), "mail", "gmail10");
         assert!(gmail_candidates[0].ends_with("generated/mail/gmail/gmail10.md"));
+    }
+
+    #[test]
+    fn project_detail_candidates_check_nested_overview_before_flat_file() {
+        let candidates = detail_path_candidates(alpnest_data_home(), "projects", "alpnest");
+
+        assert!(candidates[0].ends_with("generated/projects/feed/alpnest.md"));
+        assert!(candidates[1].ends_with("generated/projects/alpnest.md"));
+        assert!(candidates[2].ends_with("data/projects/alpnest/overview.md"));
+        assert!(candidates[3].ends_with("data/projects/alpnest.md"));
+    }
+
+    #[test]
+    fn context_path_prefers_project_context_next_to_overview() {
+        let data_home = std::env::temp_dir().join(format!(
+            "alpnest-context-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let overview_path = data_home
+            .join("data")
+            .join("projects")
+            .join("alpnest")
+            .join("overview.md");
+        let context_path = data_home
+            .join("data")
+            .join("projects")
+            .join("alpnest")
+            .join("context.md");
+
+        std::fs::create_dir_all(overview_path.parent().unwrap()).unwrap();
+        std::fs::write(&overview_path, "# alpnest\n").unwrap();
+        std::fs::write(&context_path, "# context\n").unwrap();
+
+        assert_eq!(context_path_for(&overview_path), Some(context_path));
+    }
+
+    #[test]
+    fn default_project_views_use_nested_overview_paths() {
+        let projects_panel = default_panels()
+            .into_iter()
+            .find(|panel| panel.id == "projects")
+            .expect("projects panel should exist");
+
+        let alpnest_view = projects_panel
+            .views
+            .iter()
+            .find(|view| view.id == "alpnest")
+            .expect("alpnest view should exist");
+
+        assert!(alpnest_view.path.ends_with("projects/alpnest/overview.md"));
     }
 
     #[test]

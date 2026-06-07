@@ -5,11 +5,20 @@
 - HCI
 - ML foundations
 - deep learning
+- seminar
+- low power design
+- NGI
+- MMAI
+- SWE2
+
+## praktikum
+
 - IoT lab
 - hardware security
-- seminar
 
 ## TODO
 
-- check HCI material
-- continue hardware security task
+- alpnest development
+- MMAI
+- seminar reading
+- Vitis practice
