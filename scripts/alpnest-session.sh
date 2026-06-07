@@ -11,7 +11,7 @@ layout {
     pane split_direction="vertical" {
         pane size="65%" {
             command "bash"
-            args "-lc" "ALPNEST_NO_SESSION=1 '$ALPNEST_COMMAND'"
+            args "-lc" "cd '$REPO' && ALPNEST_NO_SESSION=1 '$ALPNEST_COMMAND'"
         }
         pane size="35%" {
             command "zsh"
@@ -31,7 +31,7 @@ if command -v tmux >/dev/null 2>&1; then
   fi
 
   tmux new-session -d -s "$SESSION_NAME" -n nest -c "$REPO"
-  tmux send-keys -t "$SESSION_NAME":0.0 "ALPNEST_NO_SESSION=1 '$ALPNEST_COMMAND'" C-m
+  tmux send-keys -t "$SESSION_NAME":0.0 "cd '$REPO' && ALPNEST_NO_SESSION=1 '$ALPNEST_COMMAND'" C-m
   tmux split-window -h -t "$SESSION_NAME":0 -c "$REPO"
   tmux send-keys -t "$SESSION_NAME":0.1 "zsh -l" C-m
   tmux select-pane -t "$SESSION_NAME":0.0

@@ -21,12 +21,12 @@ LOG_FILE="$LOG_DIR/mail-sync.log"
   echo "===== $(date) ====="
 
   python3 scripts/sync_mail_apple.py \
-    --target Google:INBOX:gmail \
+    --target Google:INBOX:inbox \
     --limit 30 \
     --include-body || true
 
   python3 scripts/sync_mail_apple.py \
-    --target Exchange:Inbox:kit \
+    --target Exchange:Inbox:inbox \
     --limit 30 \
     --include-body || true
 

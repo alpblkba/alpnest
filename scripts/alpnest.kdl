@@ -1,7 +1,8 @@
 layout {
     pane split_direction="vertical" {
         pane size="65%" {
-            command "alpnest"
+            command "bash"
+            args "-lc" "cd ~/Documents/GitHub/alpnest && ALPNEST_NO_SESSION=1 alpnest"
         }
         pane size="35%" {
             command "zsh"
