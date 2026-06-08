@@ -17,6 +17,13 @@ pub struct AppState {
     pub selection: Selection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionTarget {
+    Content(usize),
+    Panel(usize, usize),
+    Section(usize, usize, usize),
+}
+
 impl AppState {
     pub fn load() -> io::Result<Self> {
         let registry = ContentRegistry::load_default()?;
@@ -26,6 +33,13 @@ impl AppState {
             registry,
             selection: Selection::default(),
         })
+    }
+
+    pub fn reload(&mut self) -> io::Result<()> {
+        let registry = ContentRegistry::load_default()?;
+        self.registry = registry;
+        self.clamp_selection();
+        Ok(())
     }
 
     pub fn selected_content(&self) -> Option<&Content> {
@@ -60,28 +74,50 @@ impl AppState {
             }
         }
 
+        if let Some(panel) = self.selected_panel() {
+            if let Some(section) = panel.sections.first() {
+                if let Some(path) = section.context_path.as_deref() {
+                    return Some(path);
+                }
+            }
+        }
+
         self.selected_content()
             .and_then(|content| content.context_path.as_deref())
     }
 
-    pub fn move_next_content(&mut self) {
-        if self.registry.contents.is_empty() {
+    pub fn move_next_row(&mut self) {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
+            self.selection = Selection::default();
             return;
         }
 
-        self.selection.content_index =
-            (self.selection.content_index + 1).min(self.registry.contents.len() - 1);
-        self.selection.panel_index = None;
-        self.selection.section_index = None;
+        let current = self.current_target();
+        let current_index = targets
+            .iter()
+            .position(|target| *target == current)
+            .unwrap_or(0);
+
+        let next_index = (current_index + 1).min(targets.len() - 1);
+        self.apply_target(targets[next_index]);
     }
 
-    pub fn move_prev_content(&mut self) {
-        if self.selection.content_index > 0 {
-            self.selection.content_index -= 1;
+    pub fn move_prev_row(&mut self) {
+        let targets = self.visible_targets();
+        if targets.is_empty() {
+            self.selection = Selection::default();
+            return;
         }
 
-        self.selection.panel_index = None;
-        self.selection.section_index = None;
+        let current = self.current_target();
+        let current_index = targets
+            .iter()
+            .position(|target| *target == current)
+            .unwrap_or(0);
+
+        let next_index = current_index.saturating_sub(1);
+        self.apply_target(targets[next_index]);
     }
 
     pub fn enter(&mut self) {
@@ -106,6 +142,11 @@ impl AppState {
     }
 
     pub fn back(&mut self) {
+        if self.current_view != AppView::MainExplorer {
+            self.current_view = AppView::MainExplorer;
+            return;
+        }
+
         if self.selection.section_index.is_some() {
             self.selection.section_index = None;
         } else if self.selection.panel_index.is_some() {
@@ -115,5 +156,113 @@ impl AppState {
 
     pub fn switch_view(&mut self, view: AppView) {
         self.current_view = view;
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.registry.contents.is_empty() {
+            self.selection = Selection::default();
+            return;
+        }
+
+        self.selection.content_index = self
+            .selection
+            .content_index
+            .min(self.registry.contents.len() - 1);
+
+        let panel_len = self
+            .selected_content()
+            .map(|content| content.panels.len())
+            .unwrap_or(0);
+
+        if panel_len == 0 {
+            self.selection.panel_index = None;
+            self.selection.section_index = None;
+            return;
+        }
+
+        let Some(panel_index) = self.selection.panel_index else {
+            self.selection.section_index = None;
+            return;
+        };
+
+        let panel_index = panel_index.min(panel_len - 1);
+        self.selection.panel_index = Some(panel_index);
+
+        let section_len = self
+            .selected_content()
+            .and_then(|content| content.panels.get(panel_index))
+            .map(|panel| panel.sections.len())
+            .unwrap_or(0);
+
+        if section_len == 0 {
+            self.selection.section_index = None;
+            return;
+        }
+
+        if let Some(section_index) = self.selection.section_index {
+            self.selection.section_index = Some(section_index.min(section_len - 1));
+        }
+    }
+
+    fn visible_targets(&self) -> Vec<SelectionTarget> {
+        let mut targets = Vec::new();
+
+        for (content_index, content) in self.registry.contents.iter().enumerate() {
+            targets.push(SelectionTarget::Content(content_index));
+
+            if self.selection.content_index != content_index {
+                continue;
+            }
+
+            for (panel_index, panel) in content.panels.iter().enumerate() {
+                targets.push(SelectionTarget::Panel(content_index, panel_index));
+
+                if self.selection.panel_index != Some(panel_index) {
+                    continue;
+                }
+
+                for (section_index, _) in panel.sections.iter().enumerate() {
+                    targets.push(SelectionTarget::Section(
+                        content_index,
+                        panel_index,
+                        section_index,
+                    ));
+                }
+            }
+        }
+
+        targets
+    }
+
+    fn current_target(&self) -> SelectionTarget {
+        match (self.selection.panel_index, self.selection.section_index) {
+            (Some(panel_index), Some(section_index)) => {
+                SelectionTarget::Section(self.selection.content_index, panel_index, section_index)
+            }
+            (Some(panel_index), None) => {
+                SelectionTarget::Panel(self.selection.content_index, panel_index)
+            }
+            _ => SelectionTarget::Content(self.selection.content_index),
+        }
+    }
+
+    fn apply_target(&mut self, target: SelectionTarget) {
+        match target {
+            SelectionTarget::Content(content_index) => {
+                self.selection.content_index = content_index;
+                self.selection.panel_index = None;
+                self.selection.section_index = None;
+            }
+            SelectionTarget::Panel(content_index, panel_index) => {
+                self.selection.content_index = content_index;
+                self.selection.panel_index = Some(panel_index);
+                self.selection.section_index = None;
+            }
+            SelectionTarget::Section(content_index, panel_index, section_index) => {
+                self.selection.content_index = content_index;
+                self.selection.panel_index = Some(panel_index);
+                self.selection.section_index = Some(section_index);
+            }
+        }
     }
 }
