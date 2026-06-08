@@ -1,0 +1,4 @@
+id = "job"
+title = "job"
+kind = "generic"
+order = 40

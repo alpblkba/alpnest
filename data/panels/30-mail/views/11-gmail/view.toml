@@ -1,0 +1,5 @@
+id = "gmail"
+title = "Gmail"
+kind = "mail_account"
+order = 11
+generated = "mail_gmail.md"
