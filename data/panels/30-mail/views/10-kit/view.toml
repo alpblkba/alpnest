@@ -1,5 +1,0 @@
-id = "kit"
-title = "KIT"
-kind = "mail_account"
-order = 10
-generated = "mail_kit.md"

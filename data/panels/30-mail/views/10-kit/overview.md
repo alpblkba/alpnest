@@ -1,1 +1,0 @@
-# KIT mail\n\nGenerated from `mail_kit.md`.\n

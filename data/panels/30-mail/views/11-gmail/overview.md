@@ -1,1 +1,0 @@
-# Gmail mail\n\nGenerated from `mail_gmail.md`.\n

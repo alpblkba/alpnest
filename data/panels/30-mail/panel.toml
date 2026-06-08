@@ -1,5 +1,0 @@
-id = "mail"
-title = "mail"
-kind = "mail"
-order = 30
-generated = "mail_feed.md"
