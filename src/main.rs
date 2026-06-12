@@ -80,7 +80,7 @@ impl RuntimeApp {
             .constraints([
                 Constraint::Length(4),
                 Constraint::Min(10),
-                Constraint::Length(3),
+                Constraint::Length(5),
             ])
             .split(frame.area());
 
