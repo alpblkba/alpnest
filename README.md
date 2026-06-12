@@ -1,327 +1,409 @@
 # alpnest
 
-A local-first terminal cockpit for tasks, school, projects, mail, and working context.
+Alpnest is an open-source, local-first, highly customizable terminal nest.
 
-Built with Rust, Ratatui, Apple Mail scripts, local markdown stores, Ollama/Qwen, and a Zellij-first terminal workflow.
+It is designed as a multi-view, multi-layered terminal cockpit for personal planning, project context, mail signals, calendar surfaces, and future local-first workflows. The default open-source version is intentionally generic: it does not ship with Alp-specific school courses, private projects, account names, local paths, or hardcoded personal data.
+
+Built with Rust, Ratatui, local markdown stores, local-first mail tooling, and a terminal-first workflow.
 
 ![alpnest beta](assets/alpnest_beta_upscaled.jpg)
 
 ## contents
 
 - [what this is](#what-this-is)
-- [current shape](#current-shape)
-- [layout and zellij workflow](#layout-and-zellij-workflow)
-- [local data model](#local-data-model)
+- [current architecture](#current-architecture)
+- [main explorer view](#main-explorer-view)
+- [content model](#content-model)
+- [default contents](#default-contents)
+- [filesystem layout](#filesystem-layout)
+- [configuration model](#configuration-model)
+- [runtime and generated state](#runtime-and-generated-state)
 - [mail pipeline](#mail-pipeline)
-- [mail filtering and triage](#mail-filtering-and-triage)
-- [qwen summarization contract](#qwen-summarization-contract)
-- [scripts](#scripts)
-- [scheduled sync and notifications](#scheduled-sync-and-notifications)
-- [project and context model](#project-and-context-model)
+- [local customization](#local-customization)
 - [running locally](#running-locally)
+- [debugging the registry](#debugging-the-registry)
 - [roadmap](#roadmap)
-- [tracelog](#tracelog)
+- [development status](#development-status)
 
 ## what this is
 
-alpnest is a personal terminal home screen. It sits before the work starts: a compact place to inspect the day, active school work, local repositories, mail signals, and context files before deciding what to do next.
+Alpnest sits before the work starts.
 
-It is not trying to become a full mail client, a code editor, or an autonomous agent. The design goal is smaller and stricter: keep local state readable, keep automation inspectable, and keep the terminal usable.
+It is not meant to replace a shell, editor, calendar, mail client, project tracker, or agent runtime. Instead, it gives the terminal a structured nest where local context can be inspected before deciding what to do next.
 
-The current direction is a cockpit rather than an app launcher. alpnest should help answer:
+Alpnest should help answer questions like:
 
 - what needs attention now?
-- which school/job/project context matters today?
-- which mails are worth seeing, and which ones should disappear?
-- what local repository state should I notice before working?
-- what should be handed to an LLM for judgement, planning, or decomposition?
+- which content surface am I currently working in?
+- what context belongs to this project, task, mail view, or calendar view?
+- which local files represent the current body and context?
+- what should be handed to a local tool, LLM, script, or future workflow?
 
-## current shape
+The design philosophy is simple:
 
-The TUI currently exposes top-level panels for:
+- local-first before cloud-first
+- readable files before hidden databases
+- inspectable automation before opaque agents
+- terminal-native interaction before heavy UI
+- user customization outside the open-source defaults
 
-- `today`
-- `school`
-- `projects`
-- `job`
-- `mail`
+## current architecture
 
-The repository contains fallback markdown files under `data/`, while runtime views are generated under `~/.local/share/alpnest/`. This keeps the program bootable even when no sync process has run yet.
+Alpnest is now organized around a dynamic content architecture.
 
-The current build supports:
-
-- nested panel/view navigation
-- generated mail overview, KIT mail, and Gmail mail views
-- full mail detail views backed by locally fetched Apple Mail bodies
-- transient detail views that do not mutate the stable mail overview tab
-- local mail event streams grouped by account, sender, subject, and message chain
-- deterministic filtering before local model calls
-- local Qwen-based summarization and triage through Ollama structured output
-- attention-aware mail placement: overview, account-only, or hidden
-- git/project-oriented local markdown structure
-- zellij/tmux session launcher so the TUI does not take over the shell
-
-## layout and zellij workflow
-
-alpnest is intended to run next to a real shell, not instead of one.
-
-The preferred launcher is:
-
-```sh
-alpnest
-```
-
-When run outside an existing terminal multiplexer, alpnest can launch a Zellij session through `scripts/alpnest-session.sh`. The layout keeps alpnest on the left and a normal login shell on the right. This makes the TUI a cockpit while the terminal remains available for real work.
-
-The current Zellij layout lives in:
+The important distinction is:
 
 ```text
-scripts/alpnest.kdl
+app view != content
 ```
 
-For debugging or running the raw TUI without opening a session:
+An app view is a real UI surface or interaction mode. The currently implemented view is the main explorer. Future app views include adding/editing content, building panels, cooking sections, configuring mail accounts, and rendering calendar-specific surfaces.
 
-```sh
-ALPNEST_NO_SESSION=1 alpnest
-```
+A content is a user-facing area of work or information. Contents are loaded dynamically from the filesystem.
 
-The same guard is used inside the Zellij/tmux launcher to prevent recursive session creation.
-
-## local data model
-
-Runtime data is kept outside the repository:
+Current Rust architecture:
 
 ```text
-~/.local/share/alpnest/
+src/
+  app.rs                 app state and selection model
+  app_view.rs            app-level view state
+  content/
+    model.rs             Content, Panel, Section, ContentType
+    registry.rs          filesystem-backed content registry
+  ui/
+    main_explorer.rs     main explorer snapshot/navigation adapter
+  main.rs                Ratatui runtime and rendering
+  mail/                  local mail feed/filter/render modules
 ```
 
-The rough structure is:
+The current runtime path is:
 
 ```text
-~/.local/share/alpnest/
-  store/
-    messages.json
-    eventstreams.json
-    mail_sync_state.json
+data/contents
+  -> ContentRegistry
+  -> AppState
+  -> MainExplorerSnapshot
+  -> Ratatui main explorer
+```
+
+## main explorer view
+
+The main explorer is the first implemented app view.
+
+It has four visible regions:
+
+```text
+header
+left top:    content / panel / section tree
+left bottom: context area
+right:       selected body area
+footer:      controls and keybindings
+```
+
+The navigation hierarchy is:
+
+```text
+content
+  panel
+    section
+```
+
+Examples:
+
+```text
+Today
+
+Mail
+  Overview
+    Overview
+
+Calendar
+  Daily
+    Daily
+  Weekly
+    Weekly
+```
+
+The main explorer is not the whole application. It is one app view. Placeholder app views already exist for future workflows:
+
+- add content
+- edit content
+- build panel
+- cook section
+- configure mail
+- calendar
+
+## content model
+
+Alpnest uses three content layers.
+
+### content
+
+A content is a top-level surface. Examples are `today`, `mail`, `calendar`, `school`, `job`, or `projects`.
+
+A content has:
+
+- id
+- title
+- content type
+- root path
+- optional body path
+- optional context path
+- zero or more panels
+- order
+- hidden flag
+
+### panel
+
+A panel belongs to a content.
+
+A panel has:
+
+- id
+- title
+- path
+- optional `.prompt.md`
+- zero or more sections
+- order
+- hidden flag
+
+Panel-local prompts are intentionally scoped. A `.prompt.md` file belongs only to that panel and must not affect other panels, contents, or global behavior.
+
+### section
+
+A section belongs to a panel.
+
+A section has:
+
+- id
+- title
+- body markdown path
+- optional context markdown path
+- order
+- hidden flag
+
+The default section pairing is:
+
+```text
+overview.md
+overview.context.md
+
+notes.md
+notes.context.md
+```
+
+Dotfiles, `.cfg` files, and `.prompt.md` files are hidden from normal navigation.
+
+## default contents
+
+The open-source default version currently ships only generic default contents:
+
+```text
+data/contents/
+  00-today/
+  10-mail/
+  20-calendar/
+```
+
+These are intentionally not Alp-specific.
+
+### today
+
+`today` is a minimal content.
+
+```text
+data/contents/00-today/
+  .today.cfg
+  overview.md
+  context.md
+```
+
+A minimal content has no panels and no sections. It only has its own body and context.
+
+### mail
+
+`mail` is a special default content.
+
+```text
+data/contents/10-mail/
+  .mail.cfg
+  overview.md
+  mail-notes.md
+```
+
+Mail has no panel-local `.prompt.md`. Mail account panels are expected to be configured or discovered locally. Raw secrets must not be stored in `.mail.cfg`.
+
+The existing local mail pipeline is preserved, but the main explorer now treats mail as a content surface rather than a hardcoded top-level panel.
+
+### calendar
+
+`calendar` is a planned special default content.
+
+```text
+data/contents/20-calendar/
+  .calendar.cfg
+  overview.md
+  daily.md
+  daily.context.md
+  weekly.md
+  weekly.context.md
+```
+
+The current calendar files are placeholders. A later calendar view may render an actual calendar surface instead of ordinary markdown.
+
+## filesystem layout
+
+Current repository layout:
+
+```text
+data/
+  contents/
+    00-today/
+    10-mail/
+    20-calendar/
   generated/
-    mail_feed.md
-    mail_kit.md
-    mail_gmail.md
-    mail/
-      feed/
-        mail0.md
-        mail1.md
-        ...
-      kit/
-        kit0.md
-        kit1.md
-        ...
-      gmail/
-        gmail0.md
-        gmail1.md
-        ...
-      feed_index.json
-  raw/
-    mail/messages/
-      gmail/
-      kit/
-  logs/
-    mail-sync.log
+  store/
+    generated/
+      state/
+
+examples/
+  alp-local-contents/
+    school/
+    projects/
+    job/
+    legacy/root notes
 ```
 
-The important rule is that generated `mail0.md`, `kit0.md`, and `gmail0.md` files are projections, not identity. Stable identity lives in message IDs and thread/event stream IDs.
+The `examples/alp-local-contents/` directory exists as an example of user-local customization. It is not part of the default open-source Alpnest runtime model.
+
+The old hardcoded data model has been removed from the default path:
+
+- old root `data/*.md` content files are no longer the canonical model
+- old `data/panels/` experiment has been removed
+- Alp-specific school/job/project data has been moved out of core defaults
+- visible `prompt.md` files have been renamed to hidden `.prompt.md`
+
+## configuration model
+
+Each content may have a hidden `.cfg` manifest:
+
+```text
+.today.cfg
+.mail.cfg
+.calendar.cfg
+.<content>.cfg
+```
+
+These files are versioned typed manifests. They describe user intent and behavior configuration.
+
+They may contain:
+
+- schema version
+- id
+- title
+- content type
+- hidden flag
+- ordering
+- UI defaults
+- deadline settings
+- panel settings
+- section settings
+- watcher/probe definitions
+- mail/project/calendar-specific settings
+
+They must not contain:
+
+- passwords
+- raw tokens
+- generated mail summaries
+- git dirty state
+- CI result state
+- runtime probe results
+
+Runtime results belong under generated state paths, not inside `.cfg` files.
+
+The current Rust parser is intentionally minimal. Full typed manifest parsing is planned.
+
+## runtime and generated state
+
+Alpnest separates configuration, source content, and runtime state.
+
+Repository defaults live under:
+
+```text
+data/contents/
+```
+
+Generated or runtime state should live under paths such as:
+
+```text
+data/generated/
+data/store/generated/state/
+~/.local/share/alpnest/
+```
+
+The important rule:
+
+```text
+.cfg defines what to check.
+runtime state stores what happened.
+```
+
+For example, a future project content may define git status watchers in its manifest, but the latest dirty/clean result should be stored in generated state, not in the manifest.
 
 ## mail pipeline
 
-The mail pipeline is local and file-backed:
+The mail pipeline remains local and file-backed.
+
+Current direction:
 
 ```text
 Apple Mail
   -> scripts/sync_mail_apple.py
-  -> store/messages.json
-  -> store/eventstreams.json
+  -> local store
   -> scripts/summarize_mail_local.py
   -> src/mail/* Rust feed builder and renderer
   -> generated markdown views
   -> alpnest TUI
 ```
 
-Apple Mail is used as the source of truth for mailbox access. The sync script can run metadata-only or fetch full body text. Full body text is stored under `~/.local/share/alpnest/raw/mail/messages/` and rendered only when a detail view is opened.
+Apple Mail is currently the preferred local source of truth for mailbox access. The project is not moving toward Gmail API, Microsoft Graph, or OAuth HTTP sync as the default direction.
 
-The TUI view is intentionally compact:
+The mail system includes:
 
-- overview shows only attention-worthy mail
-- KIT and Gmail views show account-specific filtered mail
-- clicking a row opens a full local detail projection
-- summaries are short and English by contract
-- omitted detail stays available through the raw body path
+- deterministic filtering
+- local event stream storage
+- local body storage
+- optional local Qwen/Ollama summarization
+- account-aware rendering
+- attention-aware placement: overview, account-only, or hidden
 
-## mail filtering and triage
+Mail sync is intentionally separate from the content registry. The main explorer should be able to represent mail as a content surface without redesigning the mail backend.
 
-Mail filtering has two layers.
+## local customization
 
-The first layer is deterministic and configured in:
+The default repository should stay generic.
 
-```text
-scripts/mail_filters.cfg
-```
+User-specific contents such as school, job, and personal projects should live in user-local content roots, not in the open-source defaults.
 
-This file is used to suppress senders, subjects, bodies, and known low-value patterns before they pollute the overview. It supports both the newer flat rule style and older ignore sections.
-
-The second layer is triage metadata produced by the summarizer:
-
-```json
-{
-  "category": "assignment|project|career|security|travel|promotion|noise|...",
-  "attention": "overview|account_only|hidden",
-  "importance": "high|medium|low",
-  "retention_hint": "24h|3d|7d|until_deadline|keep|hidden"
-}
-```
-
-The overview is intentionally strict. Promotions, shopping mail, newsletters, social updates, and obvious noise should not appear there. Account views can remain broader, but hidden mail should stay hidden there too.
-
-This is still a heuristic system. The long-term goal is not perfect email classification; it is a useful attention feed that does not waste the first minutes of the day.
-
-## qwen summarization contract
-
-Local summarization is handled by:
+The current example local content tree is:
 
 ```text
-scripts/summarize_mail_local.py
-prompts/qwen/mail_summarizer/
+examples/alp-local-contents/
+  school/
+  projects/
+  job/
 ```
 
-The target model is currently `qwen3:8b` through Ollama HTTP structured output.
-
-The prompt pack is split into:
+A future registry patch should support explicit local content roots such as:
 
 ```text
-prompts/qwen/mail_summarizer/
-  system.md
-  task.md
-  output_schema.md
-  examples.md
-  failure_modes.md
-  rubric.md
-  context.md
-  README.md
+ALPNEST_CONTENT_HOME
+~/.config/alpnest/contents
+~/.local/share/alpnest/contents
 ```
 
-The contract is stricter than a normal summary prompt. The model must return structured JSON with a short English summary, cleaned sender/subject, category, attention decision, importance, retention hint, action/deadline fields, language metadata, noise flag, human-review flag, and confidence.
-
-The current philosophy:
-
-- Qwen handles cleanup, short summaries, and low-stakes classification.
-- Deterministic rules catch obvious noise before model calls when possible.
-- ChatGPT or another higher-level model should handle judgement, planning, and decomposition later.
-- Non-English mail should still summarize into English.
-- Ambiguous, official, or action-bearing mail should prefer review over overconfident hiding.
-
-This makes the local model useful without pretending it is the final planner.
-
-## scripts
-
-The current script surface:
-
-```text
-scripts/sync_mail_apple.py
-  Pulls recent Apple Mail messages into the local store. Can fetch body text.
-
-scripts/summarize_mail_local.py
-  Runs deterministic triage and optional Qwen/Ollama summarization.
-
-scripts/generate_mail_view.py
-  Legacy/generated mail view helper kept around during the transition.
-
-src/bin/generate_mail_feed.rs
-  Rust mail feed renderer for overview/account/detail projections.
-
-scripts/alpnest-session.sh
-  Starts alpnest with a side terminal using Zellij first, tmux as fallback.
-
-scripts/alpnest-mail-sync.sh
-  Syncs mail, summarizes, regenerates feed output, and can trigger notifications.
-
-scripts/alpnestd.py
-  Earlier daemon runner for periodic local automation.
-
-scripts/alpnestd.cfg
-  Conservative daemon configuration.
-```
-
-The Rust side owns the TUI and the newer feed rendering path. The Python side owns collection, Apple Mail integration, and local model prompting.
-
-## scheduled sync and notifications
-
-The mail sync wrapper is:
-
-```text
-scripts/alpnest-mail-sync.sh
-```
-
-It performs the practical sync chain:
-
-```text
-sync Gmail/KIT from Apple Mail
-  -> summarize recent streams
-  -> regenerate Rust mail feed
-  -> hash generated overview
-  -> notify if the attention feed changed
-```
-
-On macOS, the intended scheduler is `launchd`, using a user LaunchAgent such as:
-
-```text
-~/Library/LaunchAgents/com.alp.alpnest.mail-sync.plist
-```
-
-The current notification mechanism uses `osascript` and macOS notifications. The useful next refinement is to notify only when a new or changed `attention=overview` item appears, rather than on any feed hash change.
-
-## project and context model
-
-The local project model is moving toward paired markdown contexts:
-
-```text
-data/
-  today.md
-  today.context.md
-  school.md
-  school.context.md
-  projects.md
-  projects.context.md
-  job.md
-  job.context.md
-  mail.md
-  mail.context.md
-```
-
-Project-like entries are becoming folders:
-
-```text
-data/projects/<project>/
-  .<project>.cfg
-  overview.md
-  context.md
-  git.md
-  notes.md
-  prompt.md
-  milestones/
-    ms0.md
-    ms1.md
-    .milestones.sh
-```
-
-The intended split is:
-
-- `overview.md`: what the TUI should show first
-- `context.md`: stable background context for the right/bottom context pane
-- `git.md`: generated local repository state
-- `notes.md`: user notes, not necessarily instruction-bearing
-- `prompt.md`: project-specific planning context for future LLM review
-- `milestones/`: arbitrary milestone files, not a fixed task count
-
-School/praktikum overlap is allowed. For example, `iot-lab` and `hardware-security` can appear under school and projects because they are both course work and local repositories.
+That will allow a local instance to load personal contents without reintroducing them into the repository defaults.
 
 ## running locally
 
@@ -331,13 +413,13 @@ Install the binary:
 cargo install --path . --force
 ```
 
-Run with session integration:
+Run the TUI:
 
 ```sh
 alpnest
 ```
 
-Run without Zellij/tmux session launch:
+Run without session integration if using a raw terminal workflow:
 
 ```sh
 ALPNEST_NO_SESSION=1 alpnest
@@ -346,9 +428,30 @@ ALPNEST_NO_SESSION=1 alpnest
 Run checks:
 
 ```sh
-cargo fmt
+cargo fmt --check
 cargo check
 cargo test
+```
+
+Run the registry inspection tool:
+
+```sh
+cargo run --bin inspect_content_registry
+```
+
+Expected default output:
+
+```text
+contents: 3
+- Today [Minimal] panels=0 body=Some("data/contents/00-today/overview.md")
+- Mail [Mail] panels=1 body=Some("data/contents/10-mail/overview.md")
+  - Overview sections=1 synthetic=true
+    - Overview -> data/contents/10-mail/overview.md
+- Calendar [Calendar] panels=2 body=Some("data/contents/20-calendar/overview.md")
+  - Daily sections=1 synthetic=true
+    - Daily -> data/contents/20-calendar/daily.md
+  - Weekly sections=1 synthetic=true
+    - Weekly -> data/contents/20-calendar/weekly.md
 ```
 
 Generate the mail feed manually:
@@ -363,34 +466,63 @@ Run the mail sync wrapper manually:
 scripts/alpnest-mail-sync.sh
 ```
 
+## debugging the registry
+
+Use:
+
+```sh
+cargo run --bin inspect_content_registry
+```
+
+This prints the discovered content tree without opening the TUI. It is useful for checking whether the registry sees the expected contents, panels, synthetic panels, and sections.
+
+A healthy default registry currently discovers:
+
+```text
+Today
+Mail
+Calendar
+```
+
+If only those three appear, the open-source default is clean and no Alp-specific local data has leaked into the core runtime.
+
 ## roadmap
 
 Near-term:
 
-- make the right/bottom context pane read the active sibling `context.md`
-- generate project `git.md` files from repositories under `~/Documents/GitHub`
-- improve Zellij layout and session ergonomics
-- reduce mail notification noise to attention-worthy deltas
-- make mail retention/deadline handling real instead of just metadata
-- add calendar snapshots and calendar-aware planning
-- separate course, praktikum, project, and job views cleanly
+- rewrite README and docs around the dynamic architecture
+- add user-local content root discovery
+- replace the manifest stub with typed manifest parsing
+- add scroll support for body and context panes
+- polish footer and keybinding display
+- add generated-state lookup for mail content
+- make calendar rendering more than placeholder markdown
+- add add/edit content view
+- add build/reshape panel view
+- add cook section workflow
 
 Later:
 
-- GitHub issue/PR status in project views
-- local branch health and dirty repo warnings
-- editable notes/prompt flows through Vim
-- review packet generation for ChatGPT planning sessions
-- task promotion from mail/calendar/project context
-- controlled handoff format for LLM planning rather than hidden automation
+- project git/build/dev watchers
+- GitHub Actions or CI probes
+- deadline propagation and effective deadline display
+- audit-friendly deadline extension entries
+- local task promotion from mail/calendar/project context
+- controlled handoff packets for LLM-assisted planning
+- editable notes and prompt flows through the terminal editor
+- optional Zellij/tmux workspace integration
 
-## tracelog
+## development status
 
-- 2026-06-07: added Zellij/tmux session workflow and started treating alpnest as a cockpit beside a real terminal.
-- 2026-06-07: reshaped project/school/job data into folder-backed markdown contexts and milestone files.
-- 2026-06-05: tightened mail filtering and attention triage so low-value promotions and social noise do not enter the main overview.
-- 2026-06-05: added Rust mail feed/detail views with stable thread identity and disposable generated slot projections.
-- 2026-05-28: added the local Qwen mail cockpit pipeline and expanded the summarizer prompt contract.
-- 2026-05-27: added early local daemon and mail decomposition snapshot pipeline.
+The dynamic architecture branch currently validates with:
 
-alpnest is still early. The useful part is not that it is complete; it is that the shape is now clear enough to keep iterating without pretending it is a finished productivity system.
+```sh
+cargo fmt --check
+cargo check
+cargo test
+cargo run --bin inspect_content_registry
+```
+
+The current test suite includes the existing mail feed/filter/render tests. The migration intentionally does not redesign `src/mail/*`.
+
+Alpnest is still early. The useful part is not that it is complete. The useful part is that the architecture is now explicit enough to evolve without hardcoding one person's life into the default application.
