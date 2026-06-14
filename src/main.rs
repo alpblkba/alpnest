@@ -63,12 +63,10 @@ impl RuntimeApp {
                 Ok(()) => self.status = Some("registry reloaded".to_string()),
                 Err(err) => self.status = Some(format!("reload failed: {err}")),
             },
-            KeyCode::Char('a') => self.state.switch_view(AppView::AddContent),
-            KeyCode::Char('e') => self.state.switch_view(AppView::EditContent),
+            KeyCode::Char('a') => self.state.switch_view(AppView::ContentEditor),
             KeyCode::Char('b') => self.state.switch_view(AppView::BuildPanel),
             KeyCode::Char('c') => self.state.switch_view(AppView::CookSection),
             KeyCode::Char('m') => self.state.switch_view(AppView::ConfigureMail),
-            KeyCode::Char('d') => self.state.switch_view(AppView::Calendar),
             KeyCode::Char('h') => self.state.switch_view(AppView::MainExplorer),
             _ => {}
         }
@@ -88,6 +86,7 @@ impl RuntimeApp {
 
         match self.state.current_view {
             AppView::MainExplorer => self.draw_main_explorer(frame, root[1]),
+            AppView::ContentEditor => self.draw_content_editor(frame, root[1]),
             view => self.draw_placeholder_view(frame, root[1], view),
         }
 
@@ -225,9 +224,61 @@ impl RuntimeApp {
         frame.render_widget(widget, area);
     }
 
+    fn draw_content_editor(&self, frame: &mut Frame, area: Rect) {
+        let selected_title = self
+            .state
+            .selected_content()
+            .map(|content| content.title.as_str())
+            .unwrap_or("none");
+
+        let selected_path = self
+            .state
+            .selected_body_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not attached yet".to_string());
+
+        let text = format!(
+            "# Add / Edit Content\n\n\
+    Current selection\n\
+    - selected content: {selected_title}\n\
+    - selected body: {selected_path}\n\n\
+    Form draft\n\
+    - mode: add new content / edit selected content\n\
+    - type: content | panel | section | milestone | note\n\
+    - title: <human readable title>\n\
+    - slug: <filesystem-safe name>\n\
+    - parent: <content/panel/container path>\n\
+    - body file: overview.md\n\
+    - context file: context.md\n\
+    - optional files: notes.md, prompt.md, git.md\n\
+    - manifest: .<slug>.cfg\n\n\
+    Path preview\n\
+    data/contents/<slug>/overview.md\n\
+    data/contents/<slug>/context.md\n\
+    data/contents/<slug>/.<slug>.cfg\n\n\
+    Rules\n\
+    - content, panel, and section should stay typed and explicit.\n\
+    - generated/runtime/mail state should not be stored in content manifests.\n\
+    - this screen is the authoring surface; the main explorer stays only for navigation.\n\n\
+    Next implementation step\n\
+    Add local input state, then bind tab/shift-tab to fields and ctrl-s to write files.\n\n\
+    Press h or Esc to return to the main explorer."
+        );
+
+        let widget = Paragraph::new(markdown_lines(&text))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" add / edit content "),
+            )
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(widget, area);
+    }
+
     fn draw_placeholder_view(&self, frame: &mut Frame, area: Rect, view: AppView) {
         let text = format!(
-            "# {}\n\nThis app view is reserved but not implemented yet.\n\nPlanned direction:\n- Add/edit new content\n- Build or reshape panels\n- Cook sections through local-first workflows\n- Configure local mail accounts\n- Render calendar-specific surfaces\n\nPress h or Esc to return to the main explorer.",
+            "# {}\n\nThis app view is reserved but not implemented yet.\n\nPlanned direction:\n- Build or reshape panels\n- Cook sections through local-first workflows\n- Configure local mail accounts\n\nPress h or Esc to return to the main explorer.",
             view.title()
         );
 
@@ -245,7 +296,7 @@ impl RuntimeApp {
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let help = match self.state.current_view {
             AppView::MainExplorer => {
-                "j/k or ↑/↓ move    enter open    esc/backspace back    r reload    a add    e edit    b build    c cook    m mail    d calendar    q quit"
+                "j/k or ↑/↓ move    enter open    esc/backspace back    a add/edit content    b build panel    c cook section    m configure mail    q quit"
             }
             _ => "h or esc return to main explorer    q quit",
         };
