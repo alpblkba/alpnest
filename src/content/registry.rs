@@ -112,8 +112,10 @@ fn load_directory_panels(path: &Path) -> io::Result<Vec<Panel>> {
             continue;
         }
 
-        let id = clean_id_from_path(&panel_path);
-        let title = title_from_id(&id);
+        let manifest = load_manifest(&panel_path)?;
+        let fallback_id = clean_id_from_path(&panel_path);
+        let id = manifest.id.clone().unwrap_or(fallback_id);
+        let title = manifest.title.clone().unwrap_or_else(|| title_from_id(&id));
         let prompt_path = first_existing(&panel_path, &[".prompt.md", "prompt.md"]);
         let sections = load_sections(&panel_path)?;
 
@@ -123,8 +125,8 @@ fn load_directory_panels(path: &Path) -> io::Result<Vec<Panel>> {
             path: panel_path,
             prompt_path,
             sections,
-            order: 0,
-            hidden: false,
+            order: manifest.order,
+            hidden: manifest.hidden,
             synthetic: false,
         };
 

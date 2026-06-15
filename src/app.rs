@@ -3,6 +3,7 @@ use std::io;
 use crate::app_view::AppView;
 use crate::content::{Content, ContentRegistry, Panel, Section};
 use crate::content_editor::ContentEditorState;
+use crate::panel_wizard::PanelWizardState;
 use crate::settings::AlpnestSettings;
 
 #[derive(Debug, Clone, Default)]
@@ -19,6 +20,7 @@ pub struct AppState {
     pub selection: Selection,
     pub content_editor: ContentEditorState,
     pub settings: AlpnestSettings,
+    pub panel_wizard: PanelWizardState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,10 @@ impl AppState {
         let registry = ContentRegistry::load_default()?;
         let content_editor = ContentEditorState::with_existing_contents(content_titles(&registry));
         let settings = AlpnestSettings::load()?;
+        let panel_wizard = registry
+            .content(0)
+            .map(PanelWizardState::from_content)
+            .unwrap_or_default();
 
         Ok(Self {
             current_view: AppView::default(),
@@ -40,6 +46,7 @@ impl AppState {
             selection: Selection::default(),
             content_editor,
             settings,
+            panel_wizard,
         })
     }
 
@@ -174,6 +181,13 @@ impl AppState {
 
     pub fn open_settings(&mut self) {
         self.current_view = AppView::Settings;
+    }
+
+    pub fn open_panel_wizard(&mut self) {
+        if let Some(content) = self.selected_content() {
+            self.panel_wizard = PanelWizardState::from_content(content);
+        }
+        self.current_view = AppView::BuildPanel;
     }
 
     fn clamp_selection(&mut self) {

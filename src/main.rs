@@ -7,6 +7,8 @@ use alpnest::{
     app_view::AppView,
     content_editor::{ContentEditorField, ContentEditorMode, EditableTextTarget},
     content_writer, external_editor,
+    panel_wizard::{PanelLogLevel, PanelWizardOperation},
+    panel_writer,
     paths::AlpnestPaths,
     settings::SettingsField,
     ui::main_explorer::{MainExplorerSnapshot, MainExplorerView},
@@ -55,7 +57,10 @@ impl RuntimeApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('t')
+            && self.state.current_view != AppView::BuildPanel
+        {
             self.toggle_right_terminal();
             return;
         }
@@ -78,6 +83,10 @@ impl RuntimeApp {
         match self.state.current_view {
             AppView::ContentEditor => {
                 self.handle_content_editor_key(key);
+                return;
+            }
+            AppView::BuildPanel => {
+                self.handle_panel_wizard_key(key);
                 return;
             }
             AppView::Settings => {
@@ -107,7 +116,7 @@ impl RuntimeApp {
             KeyCode::Char('E') => self.open_selected_context_markdown(),
             KeyCode::Esc | KeyCode::Backspace => self.state.back(),
             KeyCode::Char('a') => self.state.open_content_editor(),
-            KeyCode::Char('b') => self.state.switch_view(AppView::BuildPanel),
+            KeyCode::Char('b') => self.state.open_panel_wizard(),
             KeyCode::Char('c') => self.state.switch_view(AppView::CookSection),
             KeyCode::Char('m') => self.state.switch_view(AppView::ConfigureMail),
             KeyCode::Char('s') => self.state.open_settings(),
@@ -145,6 +154,143 @@ impl RuntimeApp {
         match self.state.settings.save() {
             Ok(()) => self.status = Some("settings saved".to_string()),
             Err(err) => self.status = Some(format!("settings save failed: {err}")),
+        }
+    }
+
+    fn handle_panel_wizard_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            if self.state.panel_wizard.is_editing_text() {
+                self.state.panel_wizard.cancel_editing();
+            }
+
+            self.apply_panel_wizard_action();
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.state.panel_wizard.toggle_inner_mode();
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            self.state.panel_wizard.focus_inner();
+            return;
+        }
+
+        if self.state.panel_wizard.is_editing_text() {
+            match key.code {
+                KeyCode::Esc => self.state.panel_wizard.cancel_editing(),
+                KeyCode::Backspace => self.state.panel_wizard.backspace(),
+                KeyCode::Enter => {
+                    self.state.panel_wizard.enter_current();
+                }
+                KeyCode::Char(c) => self.state.panel_wizard.push_char(c),
+                _ => {}
+            }
+
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                if !self.state.panel_wizard.back_or_exit() {
+                    self.state.switch_view(AppView::MainExplorer);
+                }
+            }
+            KeyCode::Char('p') => self.state.panel_wizard.focus_panels(),
+            KeyCode::Char('d') => self.state.panel_wizard.focus_defaults(),
+            KeyCode::Char('r') => self.state.panel_wizard.apply_rename_placeholder(),
+            KeyCode::Char('f') => self.state.panel_wizard.focus_fields(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                self.state.panel_wizard.move_next();
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                self.state.panel_wizard.move_prev();
+            }
+            KeyCode::Char(' ') => {
+                self.state.panel_wizard.toggle_or_cycle_current();
+            }
+            KeyCode::Enter => {
+                if !self.state.panel_wizard.enter_current() {
+                    self.apply_panel_wizard_action();
+                }
+            }
+            KeyCode::Char(c) => self.state.panel_wizard.push_char(c),
+            _ => {}
+        }
+    }
+
+    fn apply_panel_wizard_action(&mut self) {
+        match self.state.panel_wizard.operation {
+            PanelWizardOperation::Build => {
+                match panel_writer::build_panels_from_wizard(&self.state.panel_wizard) {
+                    Ok(logs) => {
+                        self.state.panel_wizard.absorb_logs(logs);
+
+                        if let Err(err) = self.state.reload() {
+                            self.state
+                                .panel_wizard
+                                .log_error(format!("reload failed after build: {err}"));
+                        }
+
+                        if let Some(content) = self.state.selected_content() {
+                            let content = content.clone();
+                            self.state.panel_wizard.refresh_existing_panels(&content);
+                        }
+                    }
+                    Err(err) => {
+                        self.state
+                            .panel_wizard
+                            .log_error(format!("build failed: {err}"));
+                    }
+                }
+            }
+            PanelWizardOperation::Rebuild => {
+                self.state
+                    .panel_wizard
+                    .log_warning("rebuild is reserved for panel wizard v1");
+            }
+            PanelWizardOperation::Destroy => {
+                if !self.state.panel_wizard.confirm_destroy {
+                    self.state.panel_wizard.confirm_destroy = true;
+
+                    if let Some(title) = self.state.panel_wizard.selected_panel_title() {
+                        self.state
+                            .panel_wizard
+                            .log_warning(format!("press enter again to destroy panel {title}"));
+                    } else {
+                        self.state
+                            .panel_wizard
+                            .log_error("no panel selected for destroy");
+                    }
+
+                    return;
+                }
+
+                match panel_writer::destroy_selected_panel_from_wizard(&self.state.panel_wizard) {
+                    Ok(logs) => {
+                        self.state.panel_wizard.confirm_destroy = false;
+                        self.state.panel_wizard.absorb_logs(logs);
+
+                        if let Err(err) = self.state.reload() {
+                            self.state
+                                .panel_wizard
+                                .log_error(format!("reload failed after destroy: {err}"));
+                        }
+
+                        if let Some(content) = self.state.selected_content() {
+                            let content = content.clone();
+                            self.state.panel_wizard.refresh_existing_panels(&content);
+                        }
+                    }
+                    Err(err) => {
+                        self.state.panel_wizard.confirm_destroy = false;
+                        self.state
+                            .panel_wizard
+                            .log_error(format!("destroy failed: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -458,6 +604,7 @@ impl RuntimeApp {
         match self.state.current_view {
             AppView::MainExplorer => self.draw_main_explorer(frame, root[1]),
             AppView::ContentEditor => self.draw_content_editor(frame, root[1]),
+            AppView::BuildPanel => self.draw_panel_wizard(frame, root[1]),
             AppView::Settings => self.draw_settings(frame, root[1]),
             view => self.draw_placeholder_view(frame, root[1], view),
         }
@@ -777,6 +924,175 @@ impl RuntimeApp {
         frame.render_widget(widget, area);
     }
 
+    fn draw_panel_wizard(&self, frame: &mut Frame, area: Rect) {
+        let wizard = &self.state.panel_wizard;
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(18),
+                Constraint::Length(9),
+                Constraint::Length(4),
+            ])
+            .split(area);
+
+        let header_rows = wizard
+            .field_rows()
+            .into_iter()
+            .map(|(text, selected)| {
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                Line::from(Span::styled(text, style))
+            })
+            .collect::<Vec<_>>();
+
+        let header = Paragraph::new(header_rows)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" panel wizard "),
+            )
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(header, outer[0]);
+
+        let middle = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(50), Constraint::Length(42)])
+            .split(outer[1]);
+
+        let inner_lines = wizard
+            .inner_lines()
+            .into_iter()
+            .map(|line| {
+                if line.starts_with("> ") {
+                    Line::from(Span::styled(
+                        line,
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(line)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let inner_title = format!(" {} ", wizard.inner_mode.label());
+        let inner = Paragraph::new(inner_lines)
+            .block(Block::default().borders(Borders::ALL).title(inner_title))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(inner, middle[0]);
+
+        let panel_lines = wizard
+            .panel_rows()
+            .into_iter()
+            .map(|(text, selected)| {
+                let marker = if selected { "> " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                Line::from(vec![Span::raw(marker), Span::styled(text, style)])
+            })
+            .collect::<Vec<_>>();
+
+        let panels = Paragraph::new(panel_lines)
+            .block(Block::default().borders(Borders::ALL).title(" panels "))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(panels, middle[1]);
+
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .split(outer[2]);
+
+        let default_lines = wizard
+            .default_rows()
+            .into_iter()
+            .map(|(text, selected)| {
+                let style = if selected || text.starts_with("selected panel:") {
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                Line::from(Span::styled(text, style))
+            })
+            .collect::<Vec<_>>();
+
+        let defaults_title = format!(
+            " defaults: {} ",
+            wizard.selected_panel_title().unwrap_or("no panel")
+        );
+
+        let defaults = Paragraph::new(default_lines)
+            .block(Block::default().borders(Borders::ALL).title(defaults_title))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(defaults, bottom[0]);
+
+        let logs = wizard
+            .logs
+            .iter()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let style = match entry.level {
+                    PanelLogLevel::Note => Style::default().fg(Color::LightYellow),
+                    PanelLogLevel::Info => Style::default().fg(Color::LightGreen),
+                    PanelLogLevel::Warning => Style::default().fg(Color::Yellow),
+                    PanelLogLevel::Error => Style::default().fg(Color::LightRed),
+                };
+
+                Line::from(Span::styled(
+                    format!("{} {}", entry.level.tag(), entry.message),
+                    style,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let notifications = Paragraph::new(logs)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" notifications "),
+            )
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(notifications, bottom[1]);
+
+        let footer = if wizard.operation == PanelWizardOperation::Destroy {
+            "j/k move    enter select/apply    ctrl-s save/apply    esc/backspace back    ctrl-t filetree/fullpath    ctrl-g inner box    p panels    r rename(reserved)    f fields"
+        } else {
+            "j/k move    enter select/apply    ctrl-s save/build    esc/backspace back    ctrl-t filetree/fullpath    ctrl-g inner box    d defaults    p panels    r rename(reserved)    f fields"
+        };
+
+        let footer = Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL));
+
+        frame.render_widget(footer, outer[3]);
+    }
+
     fn draw_settings(&self, frame: &mut Frame, area: Rect) {
         let body = Layout::default()
             .direction(Direction::Horizontal)
@@ -923,6 +1239,7 @@ Config file is stored under ALPNEST_HOME/config/alpnest.toml.",
             AppView::Settings => {
                 "tab/j move    space/enter change setting    save is automatic    h/esc back"
             }
+            AppView::BuildPanel => "panel wizard active    local footer has controls",
             _ => "h or esc return to main explorer    q quit",
         };
 

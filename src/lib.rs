@@ -14,3 +14,7 @@ pub mod settings;
 pub mod external_editor;
 
 pub mod embedded_terminal;
+
+pub mod panel_wizard;
+
+pub mod panel_writer;
