@@ -5,6 +5,7 @@ pub enum AppView {
     BuildPanel,
     CookSection,
     ConfigureMail,
+    Settings,
 }
 
 impl Default for AppView {
@@ -21,6 +22,7 @@ impl AppView {
             Self::BuildPanel => "Build Panel",
             Self::CookSection => "Cook Section",
             Self::ConfigureMail => "Configure Mail",
+            Self::Settings => "Settings",
         }
     }
 }

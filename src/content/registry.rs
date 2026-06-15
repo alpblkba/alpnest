@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::model::{Content, ContentManifest, ContentType, Panel, Section};
+use crate::paths::AlpnestPaths;
 
 #[derive(Debug, Clone, Default)]
 pub struct ContentRegistry {
@@ -11,7 +12,8 @@ pub struct ContentRegistry {
 
 impl ContentRegistry {
     pub fn load_default() -> io::Result<Self> {
-        Self::load_from_data_dir("data")
+        let paths = AlpnestPaths::resolve()?;
+        Self::load_from_contents_dir(paths.contents_dir)
     }
 
     pub fn load_from_data_dir(path: impl AsRef<Path>) -> io::Result<Self> {

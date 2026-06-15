@@ -2,6 +2,8 @@ use std::io;
 
 use crate::app_view::AppView;
 use crate::content::{Content, ContentRegistry, Panel, Section};
+use crate::content_editor::ContentEditorState;
+use crate::settings::AlpnestSettings;
 
 #[derive(Debug, Clone, Default)]
 pub struct Selection {
@@ -15,6 +17,8 @@ pub struct AppState {
     pub current_view: AppView,
     pub registry: ContentRegistry,
     pub selection: Selection,
+    pub content_editor: ContentEditorState,
+    pub settings: AlpnestSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,19 +31,29 @@ enum SelectionTarget {
 impl AppState {
     pub fn load() -> io::Result<Self> {
         let registry = ContentRegistry::load_default()?;
+        let content_editor = ContentEditorState::with_existing_contents(content_titles(&registry));
+        let settings = AlpnestSettings::load()?;
 
         Ok(Self {
             current_view: AppView::default(),
             registry,
             selection: Selection::default(),
+            content_editor,
+            settings,
         })
     }
 
     pub fn reload(&mut self) -> io::Result<()> {
         let registry = ContentRegistry::load_default()?;
+        self.content_editor.existing_content_titles = content_titles(&registry);
         self.registry = registry;
         self.clamp_selection();
         Ok(())
+    }
+
+    pub fn open_content_editor(&mut self) {
+        self.content_editor.existing_content_titles = content_titles(&self.registry);
+        self.current_view = AppView::ContentEditor;
     }
 
     pub fn selected_content(&self) -> Option<&Content> {
@@ -158,6 +172,10 @@ impl AppState {
         self.current_view = view;
     }
 
+    pub fn open_settings(&mut self) {
+        self.current_view = AppView::Settings;
+    }
+
     fn clamp_selection(&mut self) {
         if self.registry.contents.is_empty() {
             self.selection = Selection::default();
@@ -265,4 +283,12 @@ impl AppState {
             }
         }
     }
+}
+
+fn content_titles(registry: &ContentRegistry) -> Vec<String> {
+    registry
+        .contents
+        .iter()
+        .map(|content| content.title.clone())
+        .collect()
 }
