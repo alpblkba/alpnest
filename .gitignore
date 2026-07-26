@@ -1,13 +1,21 @@
-/target
-.venv/
 # local env
 .venv/
 .env
 
 # rust
 /target
-__pycache__/
 
+# python
+__pycache__/
 *.py[cod]
 
+# macos
 .DS_Store
+
+# local ALPNEST_HOME used for development runs
+.alpnest-dev/
+
+# mail account configuration carries real addresses and must never be tracked;
+# secrets themselves live in the macOS Keychain, not in this file
+config/mail/accounts.cfg
+**/config/mail/accounts.cfg

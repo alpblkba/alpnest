@@ -241,6 +241,9 @@ impl AlpnestSettings {
             SettingsField::AgenticDevelopment => {
                 self.agentic_development = !self.agentic_development;
             }
+            SettingsField::Theme => {
+                self.theme = crate::theme::Theme::from_name(&self.theme).next().name.to_string();
+            }
             _ => {}
         }
     }
@@ -280,7 +283,10 @@ impl AlpnestSettings {
                         )
                     }
                     SettingsField::Theme => {
-                        format!("theme: {}  [placeholder]", self.theme)
+                        format!(
+                            "theme: {}",
+                            crate::theme::Theme::from_name(&self.theme).label
+                        )
                     }
                     SettingsField::Keymap => {
                         format!("keymap: {}  [placeholder]", self.keymap)
@@ -296,7 +302,7 @@ impl AlpnestSettings {
                         )
                     }
                     SettingsField::MailConfiguration => {
-                        "mail configuration defaults  [placeholder]".to_string()
+                        "open mail account configuration".to_string()
                     }
                     SettingsField::CalendarConfiguration => {
                         "calendar configuration defaults  [placeholder]".to_string()

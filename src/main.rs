@@ -2,16 +2,22 @@ use std::{fs, io, time::Duration};
 
 use alpnest::embedded_terminal::{EmbeddedTerminal, EmbeddedTerminalKind};
 use alpnest::settings::TerminalLayout;
+use alpnest::theme::{BadgeLevel, MAIL as MAIL_THEME, Theme};
 use alpnest::{
     app::AppState,
     app_view::AppView,
     content_editor::{ContentEditorField, ContentEditorMode, EditableTextTarget},
     content_writer, external_editor,
-    panel_wizard::{PanelLogLevel, PanelWizardOperation},
+    mail_config::{MailConfigAction, MailConfigFocus},
+    panel_wizard::PanelWizardOperation,
     panel_writer,
     paths::AlpnestPaths,
+    section_wizard::SectionOperation,
+    section_workbench::WorkbenchFocus,
+    section_writer,
     settings::SettingsField,
     ui::main_explorer::{MainExplorerSnapshot, MainExplorerView},
+    wizard_log::{LogEntry, LogLevel},
 };
 use ansi_to_tui::IntoText;
 use color_eyre::Result;
@@ -24,10 +30,16 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
+
+/// A command queued for the right-hand pane (keychain prompt, mail sync).
+struct PendingTask {
+    title: String,
+    argv: Vec<String>,
+}
 
 struct RuntimeApp {
     state: AppState,
@@ -37,13 +49,17 @@ struct RuntimeApp {
     embedded_terminal: Option<EmbeddedTerminal>,
     pending_embedded_terminal_path: Option<std::path::PathBuf>,
     pending_embedded_shell: bool,
+    pending_embedded_task: Option<PendingTask>,
     open_shell_after_editor_exit: bool,
     right_terminal_focused: bool,
+    /// Mail sync started at launch, polled so the registry reloads when it
+    /// finishes. Runs detached so the TUI never blocks on the network.
+    background_sync: Option<std::process::Child>,
 }
 
 impl RuntimeApp {
     fn load() -> Result<Self> {
-        Ok(Self {
+        let mut app = Self {
             state: AppState::load()?,
             should_quit: false,
             status: None,
@@ -51,15 +67,117 @@ impl RuntimeApp {
             embedded_terminal: None,
             pending_embedded_terminal_path: None,
             pending_embedded_shell: false,
+            pending_embedded_task: None,
             open_shell_after_editor_exit: false,
             right_terminal_focused: false,
-        })
+            background_sync: None,
+        };
+
+        app.start_background_sync();
+        Ok(app)
+    }
+
+    /// Kick off a mail sync at launch so opening Alpnest shows current mail.
+    ///
+    /// Deliberately fire-and-forget: output is discarded, failures only set a
+    /// status line, and the registry reloads once the child exits. Ollama is
+    /// woken by the sync only when it actually has new mail to summarize.
+    fn start_background_sync(&mut self) {
+        if self.background_sync.is_some() {
+            return;
+        }
+
+        let Ok(registry) = alpnest::mail::account::MailAccountRegistry::load() else {
+            return;
+        };
+
+        if !registry.accounts.iter().any(|account| account.enabled) {
+            return;
+        }
+
+        let Some(script) = alpnest::mail_config::sync_script_path() else {
+            return;
+        };
+
+        let spawned = std::process::Command::new("python3")
+            .args([&script, "--all", "--bodies", "--summarize"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        match spawned {
+            Ok(child) => {
+                self.background_sync = Some(child);
+                self.status = Some("fetching mail in the background…".to_string());
+            }
+            Err(err) => {
+                self.status = Some(format!("background mail sync did not start: {err}"));
+            }
+        }
+    }
+
+    fn poll_background_sync(&mut self) {
+        let Some(child) = self.background_sync.as_mut() else {
+            return;
+        };
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.background_sync = None;
+
+                if let Err(err) = self.state.reload() {
+                    self.status = Some(format!("mail synced, but reload failed: {err}"));
+                    return;
+                }
+
+                self.status = Some(if status.success() {
+                    "mail sync finished".to_string()
+                } else {
+                    "mail sync finished with errors — press m to check accounts".to_string()
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.background_sync = None;
+                self.status = Some(format!("mail sync could not be polled: {err}"));
+            }
+        }
+    }
+
+    /// The palette for the surface currently on screen. Mail deliberately
+    /// runs its own so account configuration never looks like note browsing.
+    fn theme(&self) -> Theme {
+        if self.state.current_view == AppView::ConfigureMail {
+            MAIL_THEME
+        } else {
+            self.state.theme
+        }
+    }
+
+    fn terminal_busy(&self) -> bool {
+        self.embedded_terminal.is_some()
+            || self.pending_embedded_terminal_path.is_some()
+            || self.pending_embedded_shell
+            || self.pending_embedded_task.is_some()
+    }
+
+    fn queue_task(&mut self, title: String, argv: Vec<String>) {
+        self.pending_embedded_task = Some(PendingTask {
+            title: title.clone(),
+            argv,
+        });
+        self.right_terminal_focused = true;
+        self.status = Some(format!("running {title} in the right pane"));
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('t')
-            && self.state.current_view != AppView::BuildPanel
+            && !matches!(
+                self.state.current_view,
+                AppView::BuildPanel | AppView::CookSection
+            )
         {
             self.toggle_right_terminal();
             return;
@@ -75,7 +193,12 @@ impl RuntimeApp {
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // ctrl-c and ctrl-q both quit from anywhere, including inside the
+        // wizards, so there is always one way out that does not depend on
+        // which view happens to be focused.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+        {
             self.should_quit = true;
             return;
         }
@@ -93,7 +216,26 @@ impl RuntimeApp {
                 self.handle_settings_key(key);
                 return;
             }
+            AppView::CookSection => {
+                self.handle_section_wizard_key(key);
+                return;
+            }
+            AppView::ConfigureMail => {
+                self.handle_mail_config_key(key);
+                return;
+            }
+            AppView::SectionWorkbench => {
+                self.handle_workbench_key(key);
+                return;
+            }
             _ => {}
+        }
+
+        // Below here every binding is an unmodified key. Without this guard a
+        // stray ctrl-<letter> falls through to the plain-letter arm and fires
+        // the wrong view — ctrl-a opening the content editor, and so on.
+        if modified(key) {
+            return;
         }
 
         match key.code {
@@ -110,15 +252,31 @@ impl RuntimeApp {
             }
             KeyCode::Enter => {
                 if self.state.current_view == AppView::MainExplorer {
-                    self.state.enter();
+                    // A section is a leaf, so opening it means entering its
+                    // workbench. Mail and calendar leaves are messages and
+                    // dates, not units of work: they stay in the explorer and
+                    // simply render in the right pane.
+                    if self.state.selected_section().is_some()
+                        && self.state.selection_supports_sections()
+                    {
+                        if let Err(reason) = self.state.open_section_workbench() {
+                            self.status = Some(reason);
+                        }
+                    } else {
+                        self.state.enter();
+                    }
                 }
             }
             KeyCode::Char('E') => self.open_selected_context_markdown(),
             KeyCode::Esc | KeyCode::Backspace => self.state.back(),
             KeyCode::Char('a') => self.state.open_content_editor(),
-            KeyCode::Char('b') => self.state.open_panel_wizard(),
-            KeyCode::Char('c') => self.state.switch_view(AppView::CookSection),
-            KeyCode::Char('m') => self.state.switch_view(AppView::ConfigureMail),
+            KeyCode::Char('b') => {
+                if let Err(reason) = self.state.open_panel_wizard() {
+                    self.status = Some(reason);
+                }
+            }
+            KeyCode::Char('c') => self.state.open_section_wizard(),
+            KeyCode::Char('m') => self.state.open_mail_config(),
             KeyCode::Char('s') => self.state.open_settings(),
             KeyCode::Char('h') => self.state.switch_view(AppView::MainExplorer),
             _ => {}
@@ -141,6 +299,7 @@ impl RuntimeApp {
             KeyCode::Enter => match self.state.settings.selected_field {
                 SettingsField::Save => self.save_settings_status(),
                 SettingsField::Back => self.state.switch_view(AppView::MainExplorer),
+                SettingsField::MailConfiguration => self.state.open_mail_config(),
                 _ => {
                     self.state.settings.cycle_selected();
                     self.save_settings_status();
@@ -151,6 +310,10 @@ impl RuntimeApp {
     }
 
     fn save_settings_status(&mut self) {
+        // Theme changes should show up on the very next frame, not after a
+        // restart, so the live theme is refreshed before the write.
+        self.state.apply_theme_from_settings();
+
         match self.state.settings.save() {
             Ok(()) => self.status = Some("settings saved".to_string()),
             Err(err) => self.status = Some(format!("settings save failed: {err}")),
@@ -174,6 +337,10 @@ impl RuntimeApp {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
             self.state.panel_wizard.focus_inner();
+            return;
+        }
+
+        if modified(key) {
             return;
         }
 
@@ -294,6 +461,226 @@ impl RuntimeApp {
         }
     }
 
+    fn handle_section_wizard_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            if self.state.section_wizard.is_editing_text() {
+                self.state.section_wizard.cancel_editing();
+            }
+
+            self.apply_section_wizard_action();
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.state.section_wizard.toggle_inner_mode();
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            self.state.section_wizard.focus_inner();
+            return;
+        }
+
+        if modified(key) {
+            return;
+        }
+
+        if self.state.section_wizard.is_editing_text() {
+            match key.code {
+                KeyCode::Esc => self.state.section_wizard.cancel_editing(),
+                KeyCode::Backspace => self.state.section_wizard.backspace(),
+                KeyCode::Enter => {
+                    self.state.section_wizard.enter_current();
+                }
+                KeyCode::Char(c) => self.state.section_wizard.push_char(c),
+                _ => {}
+            }
+
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                if !self.state.section_wizard.back_or_exit() {
+                    self.state.switch_view(AppView::MainExplorer);
+                }
+            }
+            KeyCode::Char('s') => self.state.section_wizard.focus_sections(),
+            KeyCode::Char('d') => self.state.section_wizard.focus_defaults(),
+            KeyCode::Char('f') => self.state.section_wizard.focus_fields(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                self.state.section_wizard.move_next();
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                self.state.section_wizard.move_prev();
+            }
+            KeyCode::Char(' ') => self.state.section_wizard.toggle_or_cycle_current(),
+            KeyCode::Enter => {
+                if !self.state.section_wizard.enter_current() {
+                    self.apply_section_wizard_action();
+                }
+            }
+            KeyCode::Char(c) => self.state.section_wizard.push_char(c),
+            _ => {}
+        }
+    }
+
+    fn apply_section_wizard_action(&mut self) {
+        if !self.state.section_wizard.has_target {
+            self.state
+                .section_wizard
+                .log_error("no writable panel selected; go back and pick one");
+            return;
+        }
+
+        // Remove is the only destructive operation here, so it gets the same
+        // two-step confirmation the panel wizard uses.
+        if self.state.section_wizard.operation == SectionOperation::Remove
+            && !self.state.section_wizard.confirm_remove
+        {
+            self.state.section_wizard.confirm_remove = true;
+
+            match self.state.section_wizard.selected_section_name() {
+                Some(name) => {
+                    let name = name.to_string();
+                    self.state
+                        .section_wizard
+                        .log_warning(format!("press enter again to remove {name}"));
+                }
+                None => {
+                    self.state
+                        .section_wizard
+                        .log_error("no section selected for remove");
+                }
+            }
+
+            return;
+        }
+
+        match section_writer::apply_wizard(&self.state.section_wizard) {
+            Ok(logs) => {
+                self.state.section_wizard.confirm_remove = false;
+                self.state.section_wizard.absorb_logs(logs);
+
+                if let Err(err) = self.state.reload() {
+                    self.state
+                        .section_wizard
+                        .log_error(format!("reload failed: {err}"));
+                    return;
+                }
+
+                self.state.refresh_section_wizard_target();
+            }
+            Err(err) => {
+                self.state.section_wizard.confirm_remove = false;
+                self.state
+                    .section_wizard
+                    .log_error(format!("{} failed: {err}", self.state.section_wizard.operation.label()));
+            }
+        }
+    }
+
+    fn handle_workbench_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.toggle_right_terminal();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.switch_view(AppView::MainExplorer);
+            }
+            KeyCode::Tab => self.state.section_workbench.toggle_focus(),
+            KeyCode::Char('j') | KeyCode::Down => self.state.section_workbench.move_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.state.section_workbench.move_prev(),
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Err(err) = self.state.section_workbench.toggle_selected_step() {
+                    self.state.section_workbench.status = Some(format!("toggle failed: {err}"));
+                }
+            }
+            KeyCode::Char('n') => self.state.section_workbench.jump_to_next_action(),
+            KeyCode::Char('r') => {
+                self.state.section_workbench.reload();
+                self.state.section_workbench.status = Some("reloaded from disk".to_string());
+            }
+            KeyCode::Char('e') => {
+                let path = self.state.section_workbench.body_path.clone();
+                self.open_existing_markdown(path);
+            }
+            KeyCode::Char('c') => {
+                if let Some(path) = self.state.section_workbench.context_path.clone() {
+                    self.open_existing_markdown(path);
+                } else {
+                    self.state.section_workbench.status =
+                        Some("this section has no context file".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mail_config_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.state.mail_config.cancel_text_edit();
+            self.state.mail_config.selected_field = alpnest::mail_config::MailConfigField::Save;
+            let action = self.state.mail_config.activate();
+            self.handle_mail_config_action(action);
+            return;
+        }
+
+        if modified(key) {
+            return;
+        }
+
+        if self.state.mail_config.editing_text {
+            match key.code {
+                KeyCode::Esc => self.state.mail_config.cancel_text_edit(),
+                KeyCode::Enter | KeyCode::Tab => self.state.mail_config.commit_text_edit(),
+                KeyCode::Backspace => self.state.mail_config.backspace(),
+                KeyCode::Char(c) => self.state.mail_config.push_char(c),
+                _ => {}
+            }
+
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.state.switch_view(AppView::MainExplorer),
+            KeyCode::Char('n') => self.state.mail_config.start_new_account(),
+            KeyCode::Char('a') => self.state.mail_config.focus_accounts(),
+            KeyCode::Char('f') => self.state.mail_config.focus_form(),
+            KeyCode::Char('S') => {
+                let action = self.state.mail_config.sync_all_action();
+                self.handle_mail_config_action(action);
+            }
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => self.state.mail_config.move_next(),
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                self.state.mail_config.move_prev()
+            }
+            KeyCode::Left => self.state.mail_config.focus_accounts(),
+            KeyCode::Right => self.state.mail_config.focus_form(),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let action = self.state.mail_config.activate();
+                self.handle_mail_config_action(action);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mail_config_action(&mut self, action: MailConfigAction) {
+        match action {
+            MailConfigAction::None => {}
+            MailConfigAction::RunCommand { title, argv } => self.queue_task(title, argv),
+            MailConfigAction::Reload => {
+                if let Err(err) = self.state.reload() {
+                    self.state
+                        .mail_config
+                        .log_error(format!("reload failed: {err}"));
+                }
+            }
+        }
+    }
+
     fn handle_content_editor_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.create_content_from_editor();
@@ -302,6 +689,10 @@ impl RuntimeApp {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             self.open_content_editor_markdown();
+            return;
+        }
+
+        if modified(key) {
             return;
         }
 
@@ -438,6 +829,25 @@ impl RuntimeApp {
         let cols = area.width.saturating_sub(2).max(20);
         let rows = area.height.saturating_sub(2).max(8);
 
+        if let Some(task) = self.pending_embedded_task.take() {
+            let cwd = self.launch_cwd();
+
+            match EmbeddedTerminal::spawn_task(&task.argv, &cwd, cols, rows) {
+                Ok(terminal) => {
+                    self.embedded_terminal = Some(terminal);
+                    self.right_terminal_focused = true;
+                    self.status = Some(format!("running {}", task.title));
+                }
+                Err(err) => {
+                    self.embedded_terminal = None;
+                    self.right_terminal_focused = false;
+                    self.status = Some(format!("{} failed to start: {err}", task.title));
+                }
+            }
+
+            return;
+        }
+
         if self.pending_embedded_shell {
             self.pending_embedded_shell = false;
             let cwd = self.launch_cwd();
@@ -529,6 +939,12 @@ impl RuntimeApp {
                     self.right_terminal_focused = true;
                     self.status = Some("closing editor, then opening shell".to_string());
                 }
+                EmbeddedTerminalKind::Task => {
+                    let _ = terminal.terminate();
+                    self.embedded_terminal = None;
+                    self.right_terminal_focused = false;
+                    self.status = Some("task pane closed".to_string());
+                }
             }
             return;
         }
@@ -605,8 +1021,10 @@ impl RuntimeApp {
             AppView::MainExplorer => self.draw_main_explorer(frame, root[1]),
             AppView::ContentEditor => self.draw_content_editor(frame, root[1]),
             AppView::BuildPanel => self.draw_panel_wizard(frame, root[1]),
+            AppView::CookSection => self.draw_section_wizard(frame, root[1]),
+            AppView::SectionWorkbench => self.draw_section_workbench(frame, root[1]),
+            AppView::ConfigureMail => self.draw_mail_config(frame, root[1]),
             AppView::Settings => self.draw_settings(frame, root[1]),
-            view => self.draw_placeholder_view(frame, root[1], view),
         }
 
         self.draw_footer(frame, root[2]);
@@ -617,37 +1035,56 @@ impl RuntimeApp {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+
         let title = match self.state.current_view {
             AppView::MainExplorer => MainExplorerView::snapshot(&self.state).title,
-            view => format!("Alpnest / {}", view.title()),
+            view => view.title().to_string(),
         };
 
-        let mut spans = vec![
+        let mut crumbs = vec![
             Span::styled(
                 "alpnest",
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ╱  ", theme.faint_text()),
+            Span::styled("terminal nest", theme.dim_text()),
+            Span::styled("  ╱  ", theme.faint_text()),
+            Span::styled(
+                title,
                 Style::default()
-                    .fg(Color::LightRed)
+                    .fg(theme.accent_alt)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  —  "),
-            Span::styled(title, Style::default().fg(Color::Gray)),
         ];
 
-        if let Some(status) = &self.status {
-            spans.push(Span::raw("  —  "));
-            spans.push(Span::styled(
-                status.clone(),
-                Style::default().fg(Color::LightGreen),
-            ));
+        if self.state.current_view != AppView::MainExplorer {
+            crumbs.push(Span::styled("  ╱  ", theme.faint_text()));
+            crumbs.push(Span::styled(self.state.theme.label, theme.faint_text()));
         }
 
-        let header = Paragraph::new(Line::from(spans))
+        let status_line = match &self.status {
+            Some(status) => Line::from(Span::styled(
+                status.clone(),
+                Style::default().fg(theme.success),
+            )),
+            None => Line::from(Span::styled(
+                match self.state.current_view {
+                    AppView::MainExplorer => "navigate the nest",
+                    AppView::ContentEditor => "add or edit a content",
+                    AppView::BuildPanel => "build or reshape panels",
+                    AppView::CookSection => "cook, rename or remove sections",
+                    AppView::SectionWorkbench => "work the section",
+                    AppView::ConfigureMail => "configure mail accounts",
+                    AppView::Settings => "alpnest-wide settings",
+                },
+                theme.faint_text(),
+            )),
+        };
+
+        let header = Paragraph::new(vec![Line::from(crumbs), status_line])
             .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" terminal nest "),
-            );
+            .block(theme.plain_block());
 
         frame.render_widget(header, area);
     }
@@ -671,37 +1108,53 @@ impl RuntimeApp {
     }
 
     fn draw_content_tree(&self, frame: &mut Frame, area: Rect, snapshot: &MainExplorerSnapshot) {
+        let theme = self.theme();
+
         let lines = if snapshot.rows.is_empty() {
-            vec![Line::from(Span::styled(
-                "no contents found",
-                Style::default().fg(Color::DarkGray),
-            ))]
+            vec![Line::from(Span::styled("no contents found", theme.faint_text()))]
         } else {
             snapshot
                 .rows
                 .iter()
                 .map(|row| {
                     let indent = "  ".repeat(row.depth);
-                    let marker = if row.selected { ">" } else { " " };
-                    let style = match (row.selected, row.depth) {
-                        (true, 0) => Style::default()
-                            .fg(Color::LightMagenta)
-                            .add_modifier(Modifier::BOLD),
-                        (true, 1) => Style::default()
-                            .fg(Color::LightCyan)
-                            .add_modifier(Modifier::BOLD),
-                        (true, _) => Style::default()
-                            .fg(Color::LightGreen)
-                            .add_modifier(Modifier::BOLD),
-                        (false, 0) => Style::default().fg(Color::White),
-                        (false, 1) => Style::default().fg(Color::Gray),
-                        (false, _) => Style::default().fg(Color::DarkGray),
+
+                    let base = match row.depth {
+                        0 => theme.depth_content,
+                        1 => theme.depth_panel,
+                        _ => theme.depth_section,
+                    };
+
+                    let style = if row.selected {
+                        Style::default()
+                            .fg(theme.selection_fg)
+                            .bg(theme.selection_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(base)
+                    };
+
+                    let marker_style = if row.selected {
+                        Style::default().fg(theme.accent).bg(theme.selection_bg)
+                    } else {
+                        Style::default().fg(theme.faint)
                     };
 
                     Line::from(vec![
-                        Span::raw(indent),
-                        Span::styled(marker, style),
-                        Span::raw(" "),
+                        Span::styled(if row.selected { "▎" } else { " " }, marker_style),
+                        Span::styled(indent, style),
+                        Span::styled(
+                            match row.depth {
+                                0 => "",
+                                1 => "├ ",
+                                _ => "· ",
+                            },
+                            if row.selected {
+                                marker_style
+                            } else {
+                                Style::default().fg(theme.faint)
+                            },
+                        ),
                         Span::styled(row.label.clone(), style),
                     ])
                 })
@@ -709,33 +1162,34 @@ impl RuntimeApp {
         };
 
         let widget = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" contents "))
+            .block(theme.block("contents", true))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(widget, area);
     }
 
     fn draw_context(&self, frame: &mut Frame, area: Rect, snapshot: &MainExplorerSnapshot) {
+        let theme = self.theme();
+
         let text = match snapshot.context_path.as_deref() {
             Some(path) => read_text(path, "context file could not be read"),
             None => "context\n\nNo context file is attached to this selection yet.".to_string(),
         };
 
-        let widget = Paragraph::new(markdown_lines(&text))
-            .block(Block::default().borders(Borders::ALL).title(" context "))
+        let widget = Paragraph::new(markdown_lines(&text, theme))
+            .block(theme.block("context", false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(widget, area);
     }
 
     fn draw_focus(&mut self, frame: &mut Frame, area: Rect, snapshot: &MainExplorerSnapshot) {
-        if self.embedded_terminal.is_some()
-            || self.pending_embedded_terminal_path.is_some()
-            || self.pending_embedded_shell
-        {
+        if self.terminal_busy() {
             self.draw_embedded_terminal(frame, area);
             return;
         }
+
+        let theme = self.theme();
 
         let text = match snapshot.body_path.as_deref() {
             Some(path) => read_text(path, "body file could not be read"),
@@ -744,8 +1198,15 @@ impl RuntimeApp {
             }
         };
 
-        let widget = Paragraph::new(markdown_lines(&text))
-            .block(Block::default().borders(Borders::ALL).title(" body "))
+        let title = snapshot
+            .body_path
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+            .unwrap_or("body")
+            .to_string();
+
+        let widget = Paragraph::new(markdown_lines(&text, theme))
+            .block(theme.block(&title, false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(widget, area);
@@ -762,80 +1223,44 @@ impl RuntimeApp {
             .constraints([Constraint::Min(12), Constraint::Length(10)])
             .split(body[0]);
 
+        let theme = self.theme();
         let editor = &self.state.content_editor;
 
         let mut option_lines = vec![
-            Line::from(Span::styled(
-                "add/edit content",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("add / edit content", theme.heading())),
             Line::from(""),
         ];
 
         for (_, label, selected) in editor.field_rows() {
-            let marker = if selected { ">" } else { " " };
-            let style = if selected {
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            option_lines.push(Line::from(vec![
-                Span::styled(marker, style),
-                Span::raw(" "),
-                Span::styled(label, style),
-            ]));
+            option_lines.push(theme.list_row(label, selected));
         }
 
         let options = Paragraph::new(option_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" content setup "),
-            )
+            .block(theme.block("content setup", true))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(options, left_stack[0]);
 
-        let mut preview_lines = vec![
-            Line::from(Span::styled(
-                "path preview",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
+        let mut preview_lines = vec![Line::from(Span::styled("path preview", theme.subheading()))];
 
         for path in editor.path_preview_lines() {
-            preview_lines.push(Line::from(path));
+            preview_lines.push(Line::from(Span::styled(path, theme.dim_text())));
         }
 
         let preview = Paragraph::new(preview_lines)
-            .block(Block::default().borders(Borders::ALL).title(" preview "))
+            .block(theme.block("preview", false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(preview, left_stack[1]);
 
-        if self.embedded_terminal.is_some()
-            || self.pending_embedded_terminal_path.is_some()
-            || self.pending_embedded_shell
-        {
+        if self.terminal_busy() {
             self.draw_embedded_terminal(frame, body[1]);
             return;
         }
 
         let editor_text = editor.editor_text().to_string();
-        let right = Paragraph::new(markdown_lines(&editor_text))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(editor.editor_title()),
-            )
+        let right = Paragraph::new(markdown_lines(&editor_text, theme))
+            .block(theme.block(editor.editor_title().trim(), false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(right, body[1]);
@@ -843,6 +1268,9 @@ impl RuntimeApp {
 
     fn draw_embedded_terminal(&mut self, frame: &mut Frame, area: Rect) {
         self.ensure_embedded_terminal_started(area);
+
+        let theme = self.theme();
+        let focused = self.right_terminal_focused;
 
         let title = if let Some(terminal) = &self.embedded_terminal {
             match terminal.kind {
@@ -853,112 +1281,100 @@ impl RuntimeApp {
                         .and_then(|name| name.to_str())
                         .unwrap_or("markdown");
 
-                    if self.right_terminal_focused {
-                        format!(" right terminal: editing {file} ")
+                    if focused {
+                        format!("right pane: editing {file}")
                     } else {
-                        format!(" right terminal: running {file} ")
+                        format!("right pane: running {file}")
                     }
                 }
                 EmbeddedTerminalKind::Shell => {
-                    if self.right_terminal_focused {
-                        " right terminal: shell focused ".to_string()
+                    if focused {
+                        "right pane: shell focused".to_string()
                     } else {
-                        " right terminal: shell running ".to_string()
+                        "right pane: shell running".to_string()
                     }
                 }
+                EmbeddedTerminalKind::Task => "right pane: task".to_string(),
             }
+        } else if let Some(task) = &self.pending_embedded_task {
+            format!("right pane: starting {}", task.title)
         } else if self.pending_embedded_shell {
-            " right terminal: starting shell ".to_string()
+            "right pane: starting shell".to_string()
         } else {
-            " right terminal: starting ".to_string()
+            "right pane: starting".to_string()
         };
+
+        let block = theme.block(&title, focused);
 
         let widget = if let Some(terminal) = self.embedded_terminal.as_mut() {
             let bytes = terminal.formatted_bytes();
             let ansi_text = String::from_utf8_lossy(&bytes);
 
             match ansi_text.as_ref().into_text() {
-                Ok(text) => Paragraph::new(text)
-                    .block(Block::default().borders(Borders::ALL).title(title))
-                    .wrap(Wrap { trim: false }),
+                Ok(text) => Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
                 Err(_) => Paragraph::new("embedded terminal render error")
-                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .block(block)
                     .wrap(Wrap { trim: false }),
             }
-        } else if self.pending_embedded_shell {
-            let lines = vec![
-                Line::from(Span::styled(
-                    "starting embedded shell...",
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(format!("cwd: {}", self.launch_cwd().display())),
-            ];
-
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false })
-        } else if let Some(path) = &self.pending_embedded_terminal_path {
-            let lines = vec![
-                Line::from(Span::styled(
-                    "starting embedded editor...",
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(format!("file: {}", path.display())),
-            ];
-
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false })
         } else {
-            Paragraph::new("no embedded terminal")
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false })
+            let (headline, detail) = if let Some(task) = &self.pending_embedded_task {
+                (
+                    "starting task...".to_string(),
+                    format!("command: {}", task.argv.join(" ")),
+                )
+            } else if self.pending_embedded_shell {
+                (
+                    "starting embedded shell...".to_string(),
+                    format!("cwd: {}", self.launch_cwd().display()),
+                )
+            } else if let Some(path) = &self.pending_embedded_terminal_path {
+                (
+                    "starting embedded editor...".to_string(),
+                    format!("file: {}", path.display()),
+                )
+            } else {
+                ("no embedded terminal".to_string(), String::new())
+            };
+
+            let lines = vec![
+                Line::from(Span::styled(
+                    headline,
+                    Style::default()
+                        .fg(theme.success)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(detail, theme.dim_text())),
+            ];
+
+            Paragraph::new(lines).block(block).wrap(Wrap { trim: false })
         };
 
         frame.render_widget(widget, area);
     }
 
     fn draw_panel_wizard(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
         let wizard = &self.state.panel_wizard;
 
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
-                Constraint::Min(18),
+                Constraint::Length(6),
+                Constraint::Min(14),
                 Constraint::Length(9),
-                Constraint::Length(4),
+                Constraint::Length(3),
             ])
             .split(area);
 
         let header_rows = wizard
             .field_rows()
             .into_iter()
-            .map(|(text, selected)| {
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
-                Line::from(Span::styled(text, style))
-            })
+            .map(|(text, selected)| theme.list_row(text, selected))
             .collect::<Vec<_>>();
 
         let header = Paragraph::new(header_rows)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" panel wizard "),
-            )
+            .block(theme.block("panel wizard", true))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(header, outer[0]);
@@ -968,26 +1384,8 @@ impl RuntimeApp {
             .constraints([Constraint::Min(50), Constraint::Length(42)])
             .split(outer[1]);
 
-        let inner_lines = wizard
-            .inner_lines()
-            .into_iter()
-            .map(|line| {
-                if line.starts_with("> ") {
-                    Line::from(Span::styled(
-                        line,
-                        Style::default()
-                            .fg(Color::LightGreen)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(line)
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let inner_title = format!(" {} ", wizard.inner_mode.label());
-        let inner = Paragraph::new(inner_lines)
-            .block(Block::default().borders(Borders::ALL).title(inner_title))
+        let inner = Paragraph::new(preview_lines(wizard.inner_lines(), theme))
+            .block(theme.block(wizard.inner_mode.label(), false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(inner, middle[0]);
@@ -995,22 +1393,11 @@ impl RuntimeApp {
         let panel_lines = wizard
             .panel_rows()
             .into_iter()
-            .map(|(text, selected)| {
-                let marker = if selected { "> " } else { "  " };
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
-                Line::from(vec![Span::raw(marker), Span::styled(text, style)])
-            })
+            .map(|(text, selected)| theme.list_row(text, selected))
             .collect::<Vec<_>>();
 
         let panels = Paragraph::new(panel_lines)
-            .block(Block::default().borders(Borders::ALL).title(" panels "))
+            .block(theme.block("panels", false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(panels, middle[1]);
@@ -1023,74 +1410,518 @@ impl RuntimeApp {
         let default_lines = wizard
             .default_rows()
             .into_iter()
-            .map(|(text, selected)| {
-                let style = if selected || text.starts_with("selected panel:") {
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
-                Line::from(Span::styled(text, style))
+            .map(|(text, selected)| match text.strip_prefix("[x] ") {
+                Some(label) => theme.checkbox(label, true, selected),
+                None => match text.strip_prefix("[ ] ") {
+                    Some(label) => theme.checkbox(label, false, selected),
+                    None => theme.list_row(text, selected),
+                },
             })
             .collect::<Vec<_>>();
 
         let defaults_title = format!(
-            " defaults: {} ",
+            "defaults: {}",
             wizard.selected_panel_title().unwrap_or("no panel")
         );
 
         let defaults = Paragraph::new(default_lines)
-            .block(Block::default().borders(Borders::ALL).title(defaults_title))
+            .block(theme.block(&defaults_title, false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(defaults, bottom[0]);
 
-        let logs = wizard
-            .logs
-            .iter()
-            .rev()
-            .take(6)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|entry| {
-                let style = match entry.level {
-                    PanelLogLevel::Note => Style::default().fg(Color::LightYellow),
-                    PanelLogLevel::Info => Style::default().fg(Color::LightGreen),
-                    PanelLogLevel::Warning => Style::default().fg(Color::Yellow),
-                    PanelLogLevel::Error => Style::default().fg(Color::LightRed),
-                };
-
-                Line::from(Span::styled(
-                    format!("{} {}", entry.level.tag(), entry.message),
-                    style,
-                ))
-            })
-            .collect::<Vec<_>>();
-
-        let notifications = Paragraph::new(logs)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" notifications "),
-            )
+        let notifications = Paragraph::new(log_lines(&wizard.logs, theme, 6))
+            .block(theme.block("notifications", false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(notifications, bottom[1]);
 
-        let footer = if wizard.operation == PanelWizardOperation::Destroy {
-            "j/k move    enter select/apply    ctrl-s save/apply    esc/backspace back    ctrl-t filetree/fullpath    ctrl-g inner box    p panels    r rename(reserved)    f fields"
-        } else {
-            "j/k move    enter select/apply    ctrl-s save/build    esc/backspace back    ctrl-t filetree/fullpath    ctrl-g inner box    d defaults    p panels    r rename(reserved)    f fields"
-        };
+        let mut hints = vec![
+            ("j/k", "move"),
+            ("enter", "select"),
+            ("ctrl-s", "apply"),
+            ("ctrl-t", "preview"),
+            ("p", "panels"),
+            ("f", "fields"),
+        ];
 
-        let footer = Paragraph::new(footer)
+        if wizard.operation != PanelWizardOperation::Destroy {
+            hints.push(("d", "defaults"));
+        }
+
+        hints.push(("esc", "back"));
+
+        let footer = Paragraph::new(theme.key_hints(&hints))
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
+            .block(theme.plain_block());
 
         frame.render_widget(footer, outer[3]);
+    }
+
+    fn draw_section_wizard(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+        let wizard = &self.state.section_wizard;
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),
+                Constraint::Min(14),
+                Constraint::Length(9),
+                Constraint::Length(3),
+            ])
+            .split(area);
+
+        let header_rows = wizard
+            .field_rows()
+            .into_iter()
+            .map(|(label, value, selected)| theme.field_row(&label, &value, selected))
+            .collect::<Vec<_>>();
+
+        let header = Paragraph::new(header_rows)
+            .block(theme.block("cook section", true))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(header, outer[0]);
+
+        let middle = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(50), Constraint::Length(42)])
+            .split(outer[1]);
+
+        let inner = Paragraph::new(preview_lines(wizard.inner_lines(), theme))
+            .block(theme.block(wizard.inner_mode.label(), false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(inner, middle[0]);
+
+        let section_lines = if wizard.visible_section_len() == 0 {
+            vec![Line::from(Span::styled(
+                match wizard.operation {
+                    SectionOperation::Cook => "set a section count first",
+                    _ => "this panel has no sections yet",
+                },
+                theme.faint_text(),
+            ))]
+        } else {
+            wizard
+                .section_rows()
+                .into_iter()
+                .map(|(text, selected)| theme.list_row(text, selected))
+                .collect()
+        };
+
+        let sections = Paragraph::new(section_lines)
+            .block(theme.block("sections", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(sections, middle[1]);
+
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .split(outer[2]);
+
+        let default_lines = wizard
+            .default_rows()
+            .into_iter()
+            .map(|(label, checked, is_toggle, selected)| {
+                if is_toggle {
+                    theme.checkbox(&label, checked, selected)
+                } else {
+                    theme.list_row(label, selected)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let defaults_title = format!(
+            "defaults: {}",
+            wizard.selected_section_name().unwrap_or("no section")
+        );
+
+        let defaults = Paragraph::new(default_lines)
+            .block(theme.block(&defaults_title, false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(defaults, bottom[0]);
+
+        let notifications = Paragraph::new(log_lines(&wizard.logs, theme, 6))
+            .block(theme.block("notifications", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(notifications, bottom[1]);
+
+        let mut hints = vec![
+            ("j/k", "move"),
+            ("enter", "select"),
+            ("ctrl-s", "apply"),
+            ("ctrl-t", "preview"),
+            ("s", "sections"),
+            ("f", "fields"),
+        ];
+
+        if wizard.operation == SectionOperation::Cook {
+            hints.push(("d", "defaults"));
+        }
+
+        hints.push(("esc", "back"));
+
+        let footer = Paragraph::new(theme.key_hints(&hints))
+            .alignment(Alignment::Center)
+            .block(theme.plain_block());
+
+        frame.render_widget(footer, outer[3]);
+    }
+
+    fn draw_section_workbench(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(12), Constraint::Length(3)])
+            .split(area);
+
+        self.draw_workbench_meter(frame, outer[0]);
+
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(34),
+                Constraint::Min(40),
+                Constraint::Length(34),
+            ])
+            .split(outer[1]);
+
+        self.draw_workbench_steps(frame, body[0]);
+        self.draw_workbench_focus(frame, body[1]);
+        self.draw_workbench_brief(frame, body[2]);
+
+        let footer = Paragraph::new(theme.key_hints(&[
+            ("j/k", "move"),
+            ("space", "toggle step"),
+            ("n", "next action"),
+            ("tab", "steps/body"),
+            ("e", "edit body"),
+            ("c", "edit context"),
+            ("ctrl-t", "terminal"),
+            ("r", "reload"),
+            ("esc", "back"),
+        ]))
+        .alignment(Alignment::Center)
+        .block(theme.plain_block());
+
+        frame.render_widget(footer, outer[2]);
+    }
+
+    /// Breadcrumb on the left, a btop-style completion meter on the right.
+    fn draw_workbench_meter(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+        let workbench = &self.state.section_workbench;
+
+        let total = workbench.total_steps();
+        let done = workbench.done_steps();
+
+        const WIDTH: usize = 24;
+        let filled = if total == 0 {
+            0
+        } else {
+            ((workbench.progress_ratio() * WIDTH as f64).round() as usize).min(WIDTH)
+        };
+
+        let bar_color = if total == 0 {
+            theme.faint
+        } else if done == total {
+            theme.success
+        } else if workbench.progress_ratio() >= 0.5 {
+            theme.accent_alt
+        } else {
+            theme.warning
+        };
+
+        let mut spans = vec![
+            Span::styled(
+                workbench.breadcrumb(),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled("░".repeat(WIDTH - filled), Style::default().fg(theme.faint)),
+        ];
+
+        spans.push(Span::styled(
+            if total == 0 {
+                "  no steps".to_string()
+            } else {
+                format!("  {done}/{total}")
+            },
+            theme.dim_text(),
+        ));
+
+        if let Some(status) = &workbench.status {
+            spans.push(Span::styled("   ·   ", theme.faint_text()));
+            spans.push(Span::styled(status.clone(), Style::default().fg(theme.success)));
+        }
+
+        let widget = Paragraph::new(Line::from(spans)).block(theme.plain_block());
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_workbench_steps(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+        let workbench = &self.state.section_workbench;
+        let focused = workbench.focus == WorkbenchFocus::Steps;
+
+        let mut lines = Vec::new();
+
+        if workbench.total_steps() == 0 {
+            lines.push(Line::from(Span::styled(
+                "No steps yet.",
+                theme.dim_text(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Add checkbox lines to the body and",
+                theme.faint_text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "they become tracked steps here:",
+                theme.faint_text(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  - [ ] read chapter 3",
+                Style::default().fg(theme.accent_alt),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Press e to edit the body.",
+                theme.faint_text(),
+            )));
+        } else {
+            for (depth, text, done, selected, is_next) in workbench.step_rows() {
+                let indent = "  ".repeat(depth);
+
+                let box_style = if done {
+                    Style::default().fg(theme.success)
+                } else if is_next {
+                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.faint)
+                };
+
+                let text_style = match (selected, done) {
+                    (true, _) => theme.selected_row(),
+                    (false, true) => theme.faint_text(),
+                    (false, false) => theme.text(),
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if selected { "▎" } else { " " },
+                        if selected {
+                            Style::default().fg(theme.accent).bg(theme.selection_bg)
+                        } else {
+                            Style::default().fg(theme.faint)
+                        },
+                    ),
+                    Span::styled(indent, text_style),
+                    Span::styled(if done { "☑ " } else { "☐ " }, box_style),
+                    Span::styled(text, text_style),
+                ]));
+            }
+        }
+
+        let title = if workbench.total_steps() == 0 {
+            "steps".to_string()
+        } else {
+            format!("steps · {}/{}", workbench.done_steps(), workbench.total_steps())
+        };
+
+        let widget = Paragraph::new(lines)
+            .block(theme.block(&title, focused))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_workbench_focus(&mut self, frame: &mut Frame, area: Rect) {
+        if self.terminal_busy() {
+            self.draw_embedded_terminal(frame, area);
+            return;
+        }
+
+        let theme = self.theme();
+        let workbench = &self.state.section_workbench;
+        let focused = workbench.focus == WorkbenchFocus::Body;
+
+        let text = workbench.body_text();
+
+        let widget = Paragraph::new(markdown_lines(&text, theme))
+            .scroll((workbench.body_scroll, 0))
+            .block(theme.block(&workbench.section_title, focused))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(widget, area);
+    }
+
+    /// The guidance column: what this section is for, plus derived signals.
+    fn draw_workbench_brief(&self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+        let workbench = &self.state.section_workbench;
+
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(9)])
+            .split(area);
+
+        let brief = Paragraph::new(markdown_lines(&workbench.context_text(), theme))
+            .block(theme.block("brief", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(brief, split[0]);
+
+        let mut lines = Vec::new();
+
+        if let Some(step) = workbench.next_action() {
+            lines.push(Line::from(Span::styled("next action", theme.subheading())));
+            lines.push(Line::from(Span::styled(
+                step.text.clone(),
+                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            )));
+        } else if workbench.total_steps() > 0 {
+            lines.push(Line::from(Span::styled(
+                "all steps complete",
+                Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        for (label, value) in workbench.signal_rows() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label}: "), theme.faint_text()),
+                Span::styled(value, theme.dim_text()),
+            ]));
+        }
+
+        let signals = Paragraph::new(lines)
+            .block(theme.block("signals", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(signals, split[1]);
+    }
+
+    fn draw_mail_config(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(16), Constraint::Length(8), Constraint::Length(3)])
+            .split(area);
+
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(36), Constraint::Min(44)])
+            .split(outer[0]);
+
+        let config = &self.state.mail_config;
+
+        let account_lines = config
+            .account_rows()
+            .into_iter()
+            .map(|(text, selected)| theme.list_row(text, selected))
+            .collect::<Vec<_>>();
+
+        let accounts = Paragraph::new(account_lines)
+            .block(theme.block(
+                &format!("accounts ({})", config.registry.len()),
+                config.focus == MailConfigFocus::Accounts,
+            ))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(accounts, top[0]);
+
+        let form_lines = config
+            .form_rows()
+            .into_iter()
+            .map(|(label, value, selected, is_action)| {
+                if is_action {
+                    theme.list_row(format!("→ {value}"), selected)
+                } else {
+                    theme.field_row(&label, &value, selected)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let form_title = if config.draft_is_new {
+            "new account".to_string()
+        } else if config.dirty {
+            format!("{} (unsaved)", config.draft.id)
+        } else {
+            config.draft.id.clone()
+        };
+
+        let form = Paragraph::new(form_lines)
+            .block(theme.block(&form_title, config.focus == MailConfigFocus::Form))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(form, top[1]);
+
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(outer[1]);
+
+        let mut hint_lines = vec![Line::from(vec![
+            Span::styled("credential ", theme.dim_text()),
+            theme.badge(
+                config.credential_state().label(),
+                match config.credential_state() {
+                    alpnest::mail::keychain::CredentialState::Stored => BadgeLevel::Ok,
+                    alpnest::mail::keychain::CredentialState::Missing => BadgeLevel::Warn,
+                    alpnest::mail::keychain::CredentialState::NotApplicable => BadgeLevel::Idle,
+                    alpnest::mail::keychain::CredentialState::Unsupported => BadgeLevel::Bad,
+                },
+            ),
+        ])];
+
+        for line in config.hint_lines() {
+            hint_lines.push(Line::from(Span::styled(line, theme.dim_text())));
+        }
+
+        let hints = Paragraph::new(hint_lines)
+            .block(theme.block("provider notes", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(hints, bottom[0]);
+
+        let notifications = Paragraph::new(log_lines(&config.logs, theme, 6))
+            .block(theme.block("mail log", false))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(notifications, bottom[1]);
+
+        let footer = Paragraph::new(theme.key_hints(&[
+            ("j/k", "move"),
+            ("←/→", "list/form"),
+            ("enter", "edit/run"),
+            ("n", "new account"),
+            ("ctrl-s", "save"),
+            ("S", "sync all"),
+            ("esc", "back"),
+        ]))
+        .alignment(Alignment::Center)
+        .block(theme.plain_block());
+
+        frame.render_widget(footer, outer[2]);
+
+        if self.terminal_busy() {
+            let overlay = centered_rect(78, 62, area);
+            frame.render_widget(ratatui::widgets::Clear, overlay);
+            self.draw_embedded_terminal(frame, overlay);
+        }
     }
 
     fn draw_settings(&self, frame: &mut Frame, area: Rect) {
@@ -1099,35 +1930,19 @@ impl RuntimeApp {
             .constraints([Constraint::Length(58), Constraint::Min(50)])
             .split(area);
 
+        let theme = self.theme();
+
         let mut rows = vec![
-            Line::from(Span::styled(
-                "alpnest settings",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("alpnest settings", theme.heading())),
             Line::from(""),
         ];
 
         for (_, label, selected) in self.state.settings.rows() {
-            let marker = if selected { ">" } else { " " };
-            let style = if selected {
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            rows.push(Line::from(vec![
-                Span::styled(marker, style),
-                Span::raw(" "),
-                Span::styled(label, style),
-            ]));
+            rows.push(theme.list_row(label, selected));
         }
 
         let settings = Paragraph::new(rows)
-            .block(Block::default().borders(Borders::ALL).title(" setup "))
+            .block(theme.block("setup", true))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(settings, body[0]);
@@ -1160,60 +1975,33 @@ Config file is stored under ALPNEST_HOME/config/alpnest.toml.",
             },
         );
 
-        let right = Paragraph::new(markdown_lines(&help))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" explanation "),
-            )
+        let right = Paragraph::new(markdown_lines(&help, theme))
+            .block(theme.block("explanation", false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(right, body[1]);
     }
 
-    fn draw_placeholder_view(&self, frame: &mut Frame, area: Rect, view: AppView) {
-        let text = format!(
-            "# {}\n\nThis app view is reserved but not implemented yet.\n\nPlanned direction:\n- Build or reshape panels\n- Cook sections through local-first workflows\n- Configure local mail accounts\n\nPress h or Esc to return to the main explorer.",
-            view.title()
-        );
-
-        let widget = Paragraph::new(markdown_lines(&text))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", view.title())),
-            )
-            .wrap(Wrap { trim: false });
-
-        frame.render_widget(widget, area);
-    }
-
     fn draw_warning_popup(&self, frame: &mut Frame, area: Rect, message: &str) {
+        let theme = self.theme();
         let popup_area = centered_rect(54, 18, area);
 
         let text = vec![
             Line::from(Span::styled(
                 "warning",
                 Style::default()
-                    .fg(Color::LightRed)
+                    .fg(theme.danger)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(message.to_string()),
+            Line::from(Span::styled(message.to_string(), theme.text())),
             Line::from(""),
-            Line::from(Span::styled(
-                "press any key to continue",
-                Style::default().fg(Color::Gray),
-            )),
+            Line::from(Span::styled("press any key to continue", theme.faint_text())),
         ];
 
         let widget = Paragraph::new(text)
             .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" alpnest notice "),
-            )
+            .block(theme.block("alpnest notice", true))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(ratatui::widgets::Clear, popup_area);
@@ -1221,34 +2009,111 @@ Config file is stored under ALPNEST_HOME/config/alpnest.toml.",
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = match self.state.current_view {
-            AppView::MainExplorer => {
-                if self.right_terminal_focused {
-                    "right terminal focused    ctrl-t toggle shell/close    vim :wq/:q exits editor    ctrl-g unfocus terminal"
-                } else {
-                    "j/k move    enter open tree    E edit context    ctrl-t terminal    a content    b panel    c section    m mail    s settings    q quit"
-                }
-            }
-            AppView::ContentEditor => {
-                if self.right_terminal_focused {
-                    "right terminal focused    ctrl-t toggle shell/close    vim :wq/:q exits editor    ctrl-g unfocus terminal"
-                } else {
-                    "tab/j move    space cycle/toggle    enter edit markdown/select    ctrl-o edit in right terminal    ctrl-s create    esc cancel"
-                }
-            }
-            AppView::Settings => {
-                "tab/j move    space/enter change setting    save is automatic    h/esc back"
-            }
-            AppView::BuildPanel => "panel wizard active    local footer has controls",
-            _ => "h or esc return to main explorer    q quit",
+        let theme = self.theme();
+
+        let terminal_hints = [
+            ("ctrl-t", "toggle shell"),
+            ("ctrl-g", "unfocus"),
+            (":wq", "exit editor"),
+        ];
+
+        let hints: &[(&str, &str)] = match self.state.current_view {
+            _ if self.right_terminal_focused => &terminal_hints,
+            AppView::MainExplorer => &[
+                ("j/k", "move"),
+                ("enter", "open"),
+                ("E", "edit context"),
+                ("ctrl-t", "terminal"),
+                ("a", "content"),
+                ("b", "panel"),
+                ("c", "section"),
+                ("m", "mail"),
+                ("s", "settings"),
+                ("q", "quit"),
+            ],
+            AppView::ContentEditor => &[
+                ("tab/j", "move"),
+                ("space", "cycle"),
+                ("enter", "edit"),
+                ("ctrl-o", "right pane"),
+                ("ctrl-s", "create"),
+                ("esc", "cancel"),
+            ],
+            AppView::Settings => &[
+                ("tab/j", "move"),
+                ("space", "change"),
+                ("enter", "open/change"),
+                ("esc", "back"),
+            ],
+            AppView::BuildPanel
+            | AppView::CookSection
+            | AppView::ConfigureMail
+            | AppView::SectionWorkbench => &[("", "controls are in the view's own footer")],
         };
 
-        let widget = Paragraph::new(help)
+        let widget = Paragraph::new(theme.key_hints(hints))
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
+            .block(theme.plain_block());
 
         frame.render_widget(widget, area);
     }
+}
+
+/// Preview panes mark the active row with a leading `>`; colour it so the
+/// eye lands on it without reading.
+fn preview_lines(lines: Vec<String>, theme: Theme) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.starts_with("> ") {
+                Line::from(Span::styled(
+                    line,
+                    Style::default()
+                        .fg(theme.accent_alt)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else if line.trim_start().starts_with("file:")
+                || line.trim_start().starts_with("dir:")
+            {
+                Line::from(Span::styled(line, theme.faint_text()))
+            } else {
+                Line::from(Span::styled(line, theme.dim_text()))
+            }
+        })
+        .collect()
+}
+
+fn log_lines(logs: &[LogEntry], theme: Theme, take: usize) -> Vec<Line<'static>> {
+    logs.iter()
+        .rev()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|entry| {
+            let style = match entry.level {
+                LogLevel::Note => Style::default().fg(theme.dim),
+                LogLevel::Info => Style::default().fg(theme.success),
+                LogLevel::Warning => Style::default().fg(theme.warning),
+                LogLevel::Error => Style::default().fg(theme.danger),
+            };
+
+            Line::from(vec![
+                Span::styled(format!("{} ", entry.level.tag()), style),
+                Span::styled(entry.message.clone(), theme.text()),
+            ])
+        })
+        .collect()
+}
+
+/// True when a modifier is held that no plain-key binding should react to.
+///
+/// Every view binds bare letters (`a`, `b`, `q`, …). Without checking this, a
+/// `ctrl-<letter>` that a handler does not claim falls through to the bare
+/// arm and either fires the wrong action or types a stray character.
+fn modified(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1308,39 +2173,58 @@ fn read_text(path: &str, fallback: &str) -> String {
         .unwrap_or_else(|err| format!("# error\n\n{fallback}\n\npath: {path}\nerror: {err}"))
 }
 
-fn markdown_lines(text: &str) -> Vec<Line<'static>> {
-    text.lines().map(markdown_line).collect()
+fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
+    text.lines().map(|line| markdown_line(line, theme)).collect()
 }
 
-fn markdown_line(line: &str) -> Line<'static> {
+fn markdown_line(line: &str, theme: Theme) -> Line<'static> {
     let trimmed = line.trim_start();
 
-    if trimmed.starts_with("# ") {
+    if let Some(rest) = trimmed.strip_prefix("### ") {
         return Line::from(Span::styled(
-            trimmed.trim_start_matches("# ").to_string(),
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            rest.to_string(),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ));
     }
 
-    if trimmed.starts_with("## ") {
-        return Line::from(Span::styled(
-            trimmed.trim_start_matches("## ").to_string(),
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+    if let Some(rest) = trimmed.strip_prefix("## ") {
+        return Line::from(Span::styled(rest.to_string(), theme.subheading()));
     }
 
-    if trimmed.starts_with("- ") {
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        return Line::from(Span::styled(rest.to_string(), theme.heading()));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
         return Line::from(vec![
-            Span::styled("• ", Style::default().fg(Color::LightGreen)),
-            Span::raw(trimmed.trim_start_matches("- ").to_string()),
+            Span::styled("☐ ", Style::default().fg(theme.warning)),
+            Span::styled(rest.to_string(), theme.text()),
         ]);
     }
 
-    Line::from(line.to_string())
+    if let Some(rest) = trimmed.strip_prefix("- [x] ") {
+        return Line::from(vec![
+            Span::styled("☑ ", Style::default().fg(theme.success)),
+            Span::styled(rest.to_string(), theme.dim_text()),
+        ]);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Line::from(vec![
+            Span::styled("• ", Style::default().fg(theme.accent_alt)),
+            Span::styled(rest.to_string(), theme.text()),
+        ]);
+    }
+
+    if trimmed.starts_with("```") {
+        return Line::from(Span::styled(line.to_string(), theme.faint_text()));
+    }
+
+    if trimmed.starts_with("> ") {
+        return Line::from(Span::styled(line.to_string(), theme.dim_text()));
+    }
+
+    Line::from(Span::styled(line.to_string(), theme.text()))
 }
 
 fn main() -> Result<()> {
@@ -1367,6 +2251,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 
     while !app.should_quit {
         app.poll_embedded_terminal();
+        app.poll_background_sync();
         terminal.draw(|frame| app.draw(frame))?;
 
         if event::poll(Duration::from_millis(30))? {

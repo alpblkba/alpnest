@@ -70,14 +70,23 @@ Implemented:
 - right-pane shell toggle in main workflows
 - settings file under the runtime configuration directory
 - local-first mail pipeline modules and generated mail surfaces
+- cook section view: cook, rename and remove `<section>.md` / `<section>.context.md` pairs
+- configure mail view: multi-account IMAP setup with Keychain-backed credentials
+- multi-account IMAP sync projecting one mail panel per connected account
+- mail drill-down: each message is a section holding the full original
+- qwen summarization wired into the sync, waking and unloading the model per batch
+- classified IMAP failures with per-provider remedies
+- section workbench: a standalone working surface per section
+- swappable themes (`nest`, `euporie`, `btop`, `mono`) applied across every view
 
 Partially implemented or reserved:
 
 - panel rebuild workflow
 - panel rename/move workflow
 - destroy confirmation polish
-- section creation/cooking workflow
 - calendar-specific rendering
+- project content git discovery
+- deadline read-back (deadlines are written to manifests but not yet enforced)
 - complete terminal-emulator behavior for the embedded terminal
 - typed manifest parsing beyond the current minimal parser
 
@@ -352,15 +361,44 @@ keymap = "default"
 agentic_development = false
 ```
 
+### Section workbench
+
+Opening a section with `enter` leaves the three-pane explorer and gives that
+section the whole screen.
+
+The workbench deliberately avoids the board-and-cards model. A Trello-style
+board makes you maintain containers, and the real state ends up in a database
+reachable only through the UI. Here the **document is the state**: steps are
+the `- [ ]` / `- [x]` checkboxes already inside the section's markdown, and
+toggling one rewrites that exact line in the file. Editing in vim and toggling
+in the TUI are the same operation on the same bytes, so there is nothing to
+sync and the file stays readable without Alpnest.
+
+On top of that the view answers the question a board never does — *what do I do
+next?* The first unfinished step is pinned and highlighted.
+
+```text
+breadcrumb + completion meter
+steps rail  |  body or editor  |  brief + signals
+footer
+```
+
+- `j` / `k` move, `space` toggles the selected step
+- `n` jumps to the next action
+- `tab` switches between the steps rail and the body
+- `e` edits the body, `c` edits the context, `ctrl-t` opens a terminal
+- `r` reloads from disk after an external edit
+
+Sections with no checkboxes show how to add them rather than an empty pane.
+
 ### Reserved views
 
 Reserved views exist so the UI model can grow without treating every workflow as a content item.
 
 Current reserved directions:
 
-- section cooking and scaffolding
-- mail account configuration
 - calendar-specific rendering
+- project git tracking surfaces
 - local agent handoff and workflow surfaces
 
 ## Filesystem model
@@ -916,19 +954,19 @@ Near-term:
 - design guarded path rename/move semantics
 - improve destroy confirmation UX
 - make filetree preview read the actual filesystem after creation
-- add section creation and section cooking
 - add body/context scrolling
 - improve embedded terminal rendering
 - strengthen typed manifest parsing
-- improve mail view integration
+- OAuth2 device flow for Microsoft tenants that block basic auth
+- incremental IMAP sync using stored UIDVALIDITY/UIDNEXT
 
 Later:
 
-- project git/build/test probes
+- local git tracker for project content, then commit-map and graph rendering
+- calendar rendering with macOS Calendar and Google Calendar integration
+- a simple deadline mechanism that reads back what the wizards already write
+- embedded music player opened by shortcut, plus tmux/zellij script updates
 - mail attention scoring and richer summaries
-- deadline-aware panel ordering
-- calendar surfaces beyond markdown placeholders
 - local task promotion from mail/calendar/project context
 - local agent handoff packets
-- optional tmux/zellij integration
 - cell-grid terminal renderer

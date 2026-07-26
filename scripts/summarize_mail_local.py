@@ -20,11 +20,16 @@ import json
 import re
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import summarizer_backend
 from paths import EVENTSTREAMS_JSON, MESSAGES_JSON
+
+# Streams summarized between writes to eventstreams.json.
+CHECKPOINT_EVERY = 5
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIL_FILTERS_CFG = Path(__file__).with_name("mail_filters.cfg")
@@ -786,6 +791,7 @@ def extract_json_object(value: str) -> dict[str, Any] | None:
 
 
 def ollama_generate(model: str, prompt: str) -> str:
+    """Deprecated direct path; kept so older callers keep working."""
     request_payload = {
         "model": model,
         "prompt": prompt,
@@ -808,6 +814,64 @@ def ollama_generate(model: str, prompt: str) -> str:
         response_payload = json.loads(response.read().decode("utf-8"))
 
     return compact(response_payload.get("response"), "")
+
+
+def ollama_available() -> bool:
+    """Cheap liveness probe so an absent Ollama degrades to the fallback path."""
+    try:
+        request = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=3):
+            return True
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def unload_model(model: str) -> bool:
+    """Ask Ollama to evict the model from memory immediately.
+
+    `keep_alive: 0` on an empty generate call unloads right away instead of
+    leaving several GB resident for the default five-minute idle window. Mail
+    sync runs on a short timer, so without this the model would effectively
+    never leave memory.
+    """
+    payload = {"model": model, "prompt": "", "stream": False, "keep_alive": 0}
+
+    try:
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=30):
+            return True
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def pending_stream_count(
+    eventstreams: list[dict[str, Any]],
+    messages_by_id: dict[str, dict[str, Any]],
+    force: bool,
+    limit: int,
+) -> int:
+    """How many streams actually need the model, before waking anything."""
+    pending = 0
+
+    for stream in eventstreams:
+        if pending >= limit:
+            break
+
+        if not should_resummarize(stream, force):
+            continue
+
+        if latest_message(stream, messages_by_id) is None:
+            continue
+
+        pending += 1
+
+    return pending
 
 
 def bool_from_model(value: Any, fallback: bool) -> bool:
@@ -912,7 +976,7 @@ def normalize_model_result(raw: dict[str, Any], fallback: dict[str, Any]) -> dic
 
 def summarize_message(
     message: dict[str, Any],
-    model: str,
+    backend_config: "summarizer_backend.SummarizerConfig",
     use_ollama: bool,
     filters: dict[str, list[str]],
     prompt_pack: str,
@@ -926,7 +990,9 @@ def summarize_message(
         return fallback, "fallback:obvious-noise"
 
     try:
-        output = ollama_generate(model, build_prompt(message, prompt_pack))
+        output = summarizer_backend.generate(
+            backend_config, build_prompt(message, prompt_pack), OLLAMA_SUMMARY_SCHEMA
+        )
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return fallback, "fallback"
 
@@ -934,7 +1000,9 @@ def summarize_message(
     if parsed is None:
         return fallback, "fallback"
 
-    return normalize_model_result(parsed, fallback), f"ollama:{model}"
+    return normalize_model_result(parsed, fallback), (
+        f"{backend_config.provider}:{backend_config.model}"
+    )
 
 
 def should_resummarize(stream: dict[str, Any], force: bool) -> bool:
@@ -947,12 +1015,13 @@ def should_resummarize(stream: dict[str, Any], force: bool) -> bool:
 def summarize_streams(
     messages: list[dict[str, Any]],
     eventstreams: list[dict[str, Any]],
-    model: str,
+    backend_config: "summarizer_backend.SummarizerConfig",
     limit: int,
     use_ollama: bool,
     force: bool,
     filters: dict[str, list[str]],
     prompt_pack: str,
+    checkpoint: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     messages_by_id = message_lookup(messages)
     updated = 0
@@ -975,7 +1044,9 @@ def summarize_streams(
             flush=True,
         )
 
-        summary, source = summarize_message(message, model, use_ollama, filters, prompt_pack)
+        summary, source = summarize_message(
+            message, backend_config, use_ollama, filters, prompt_pack
+        )
 
         print(
             f"[{updated + 1}/{limit}] done: {summary['display_sender']} / {summary['display_subject']} ({source})",
@@ -1006,12 +1077,18 @@ def summarize_streams(
 
         updated += 1
 
+        # Checkpoint as we go. A long backlog can take tens of minutes of
+        # model time; losing all of it to one interruption is unacceptable,
+        # and a partially summarized store is still useful.
+        if checkpoint is not None and updated % CHECKPOINT_EVERY == 0:
+            checkpoint(eventstreams)
+
     return eventstreams, updated
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize local alpnest mail streams.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name; default: {DEFAULT_MODEL}")
+    parser.add_argument("--model", default=None, help=f"Ollama model name; default: {DEFAULT_MODEL}")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help=f"streams to summarize; default: {DEFAULT_LIMIT}")
     parser.add_argument("--no-ollama", action="store_true", help="use deterministic fallback only")
     parser.add_argument("--force", action="store_true", help="resummarize streams that already have summaries")
@@ -1025,6 +1102,16 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_PROMPT_DIR),
         help=f"prompt pack directory; default: {DEFAULT_PROMPT_DIR}",
     )
+    parser.add_argument(
+        "--provider",
+        choices=summarizer_backend.PROVIDERS,
+        help="override the configured summarizer backend",
+    )
+    parser.add_argument(
+        "--unload",
+        action="store_true",
+        help="evict the model from Ollama once the batch finishes",
+    )
     return parser.parse_args()
 
 
@@ -1034,21 +1121,67 @@ def main() -> int:
     messages = read_json_list(MESSAGES_JSON)
     eventstreams = read_json_list(EVENTSTREAMS_JSON)
     filters = read_mail_filters(Path(args.filters))
+    limit = max(args.limit, 0)
+
+    # Decide whether the model is needed *before* touching Ollama. On an empty
+    # inbox this exits without ever loading the weights.
+    pending = pending_stream_count(
+        eventstreams, message_lookup(messages), args.force, limit
+    )
+
+    if pending == 0:
+        print("nothing to summarize; ollama was not contacted")
+        return 0
+
+    backend_config = summarizer_backend.load_config()
+
+    if args.provider:
+        backend_config.provider = args.provider
+        backend_config.model = args.model or summarizer_backend.DEFAULT_MODELS.get(
+            args.provider, backend_config.model
+        )
+    elif args.model:
+        backend_config.model = args.model
+
+    use_ollama = not args.no_ollama
+
+    if use_ollama and not summarizer_backend.available(backend_config):
+        print(
+            f"{backend_config.provider} backend unavailable; using deterministic fallback"
+        )
+        use_ollama = False
+
+    label = (
+        f"{backend_config.provider}:{backend_config.model}" if use_ollama else "fallback"
+    )
+    print(f"{pending} stream(s) need summarizing ({label})")
+
     prompt_pack = read_prompt_pack(Path(args.prompt_dir))
 
-    updated_streams, updated_count = summarize_streams(
-        messages=messages,
-        eventstreams=eventstreams,
-        model=args.model,
-        limit=max(args.limit, 0),
-        use_ollama=not args.no_ollama,
-        force=args.force,
-        filters=filters,
-        prompt_pack=prompt_pack,
-    )
-    backfill_triage_fields(updated_streams, message_lookup(messages), filters)
-
-    write_json_list(EVENTSTREAMS_JSON, updated_streams)
+    try:
+        updated_streams, updated_count = summarize_streams(
+            messages=messages,
+            eventstreams=eventstreams,
+            backend_config=backend_config,
+            limit=limit,
+            use_ollama=use_ollama,
+            force=args.force,
+            filters=filters,
+            prompt_pack=prompt_pack,
+            checkpoint=lambda streams: write_json_list(EVENTSTREAMS_JSON, streams),
+        )
+        backfill_triage_fields(updated_streams, message_lookup(messages), filters)
+        write_json_list(EVENTSTREAMS_JSON, updated_streams)
+    finally:
+        # Unload even if summarizing raised, so a crash cannot leave the model
+        # resident until Ollama's idle timer fires.
+        if use_ollama and args.unload:
+            if backend_config.is_local:
+                print(
+                    "unloaded"
+                    if summarizer_backend.unload(backend_config)
+                    else "unload request failed"
+                )
 
     print(f"summarized streams: {updated_count}")
     print(f"mail filters: {Path(args.filters)}")

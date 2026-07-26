@@ -4,6 +4,7 @@ pub enum AppView {
     ContentEditor,
     BuildPanel,
     CookSection,
+    SectionWorkbench,
     ConfigureMail,
     Settings,
 }
@@ -21,6 +22,7 @@ impl AppView {
             Self::ContentEditor => "Add / Edit Content",
             Self::BuildPanel => "Build Panel",
             Self::CookSection => "Cook Section",
+            Self::SectionWorkbench => "Workbench",
             Self::ConfigureMail => "Configure Mail",
             Self::Settings => "Settings",
         }

@@ -66,30 +66,7 @@ impl PanelWizardInnerMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelLogLevel {
-    Note,
-    Info,
-    Warning,
-    Error,
-}
-
-impl PanelLogLevel {
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Note => "[note]",
-            Self::Info => "[info]",
-            Self::Warning => "[warning]",
-            Self::Error => "[ERROR]",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PanelLogEntry {
-    pub level: PanelLogLevel,
-    pub message: String,
-}
+pub use crate::wizard_log::{LogEntry as PanelLogEntry, LogLevel as PanelLogLevel};
 
 #[derive(Debug, Clone)]
 pub struct PanelDefaults {

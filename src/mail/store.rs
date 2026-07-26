@@ -43,9 +43,17 @@ impl MailStore {
     }
 }
 
+/// The mail store used to default to `~/.local/share/alpnest` while the app
+/// itself resolved `~/Library/Application Support/alpnest`, so the sync
+/// helpers wrote where the TUI never looked. Both now resolve the same root
+/// unless `ALPNEST_DATA_HOME` explicitly overrides it.
 pub fn alpnest_data_home() -> PathBuf {
     if let Ok(value) = env::var("ALPNEST_DATA_HOME") {
         return PathBuf::from(value);
+    }
+
+    if let Ok(paths) = crate::paths::AlpnestPaths::resolve() {
+        return paths.home;
     }
 
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
     Minimal,
     Task,
@@ -20,6 +20,25 @@ impl ContentType {
             "calendar" => Self::Calendar,
             _ => Self::Unknown,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Task => "task",
+            Self::Project => "project",
+            Self::Mail => "mail",
+            Self::Calendar => "calendar",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Mail and calendar are *special* contents: they render their own domain
+    /// surface (messages, dates) and do not participate in the section
+    /// grammar. Nothing may cook a section into them, and opening one of their
+    /// leaves must not present a task workbench.
+    pub fn has_sections(self) -> bool {
+        !matches!(self, Self::Mail | Self::Calendar)
     }
 }
 
@@ -73,6 +92,38 @@ pub struct Section {
 impl Section {
     pub fn is_navigable(&self) -> bool {
         !self.hidden
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::ContentType;
+
+    #[test]
+    fn special_contents_do_not_have_sections() {
+        assert!(!ContentType::Mail.has_sections());
+        assert!(!ContentType::Calendar.has_sections());
+    }
+
+    #[test]
+    fn authored_contents_have_sections() {
+        assert!(ContentType::Task.has_sections());
+        assert!(ContentType::Project.has_sections());
+        assert!(ContentType::Minimal.has_sections());
+        assert!(ContentType::Unknown.has_sections());
+    }
+
+    #[test]
+    fn manifest_values_round_trip_through_labels() {
+        for kind in [
+            ContentType::Minimal,
+            ContentType::Task,
+            ContentType::Project,
+            ContentType::Mail,
+            ContentType::Calendar,
+        ] {
+            assert_eq!(ContentType::from_manifest_value(kind.label()), kind);
+        }
     }
 }
 

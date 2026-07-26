@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
+# Periodic Alpnest mail sync.
+#
+# Syncs every enabled account from config/mail/accounts.cfg over IMAP, then
+# runs the local summarizer and regenerates the attention feed. Apple Mail
+# targets are still supported for accounts whose provider is apple_local.
 set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
-REPO="$HOME/Documents/GitHub/alpnest"
-DATA="$HOME/.local/share/alpnest"
+REPO="${ALPNEST_REPO:-$HOME/Documents/GitHub/alpnest}"
+
+# Must agree with src/paths.rs and scripts/paths.py.
+if [ -n "${ALPNEST_HOME:-}" ]; then
+  DATA="$ALPNEST_HOME"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  DATA="$HOME/Library/Application Support/alpnest"
+else
+  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/alpnest"
+fi
+
 STATE_DIR="$DATA/state"
 LOG_DIR="$DATA/logs"
+ACCOUNTS_CFG="$DATA/config/mail/accounts.cfg"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
@@ -20,21 +35,27 @@ LOG_FILE="$LOG_DIR/mail-sync.log"
   echo
   echo "===== $(date) ====="
 
-  python3 scripts/sync_mail_apple.py \
-    --target Google:INBOX:inbox \
-    --limit 30 \
-    --include-body || true
+  if [ -f "$ACCOUNTS_CFG" ]; then
+    python3 scripts/sync_mail_imap.py --all --bodies || true
+  else
+    echo "no accounts.cfg at $ACCOUNTS_CFG; skipping IMAP sync"
+  fi
 
-  python3 scripts/sync_mail_apple.py \
-    --target Exchange:Inbox:inbox \
-    --limit 30 \
-    --include-body || true
+  # Local Apple Mail targets, if the user still keeps any.
+  if [ -n "${ALPNEST_APPLE_MAIL_TARGETS:-}" ]; then
+    for target in $ALPNEST_APPLE_MAIL_TARGETS; do
+      python3 scripts/sync_mail_apple.py \
+        --target "$target" \
+        --limit 30 \
+        --include-body || true
+    done
+  fi
 
   python3 scripts/summarize_mail_local.py \
     --model qwen3:8b \
     --limit 30 || true
 
-  cargo run --quiet --bin generate_mail_feed
+  cargo run --quiet --bin generate_mail_feed || true
 
   if [ -f "$DATA/generated/mail_feed.md" ]; then
     shasum -a 256 "$DATA/generated/mail_feed.md" | awk '{print $1}' > "$NEW_HASH_FILE"

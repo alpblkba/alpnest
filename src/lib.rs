@@ -3,6 +3,7 @@ pub mod app_view;
 pub mod content;
 pub mod mail;
 pub mod paths;
+pub mod theme;
 pub mod ui;
 
 pub mod content_editor;
@@ -18,3 +19,13 @@ pub mod embedded_terminal;
 pub mod panel_wizard;
 
 pub mod panel_writer;
+
+pub mod section_wizard;
+
+pub mod section_writer;
+
+pub mod section_workbench;
+
+pub mod mail_config;
+
+pub mod wizard_log;

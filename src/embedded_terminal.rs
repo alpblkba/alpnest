@@ -10,6 +10,9 @@ use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 pub enum EmbeddedTerminalKind {
     Editor,
     Shell,
+    /// A one-shot command (keychain prompt, mail sync) whose output the user
+    /// reads in the right pane until it exits.
+    Task,
 }
 
 pub struct EmbeddedTerminal {
@@ -22,7 +25,15 @@ pub struct EmbeddedTerminal {
 }
 
 impl EmbeddedTerminal {
-    pub fn spawn_editor(editor: &str, path: &Path, cols: u16, rows: u16) -> io::Result<Self> {
+    /// Every spawn goes through the login shell so the user's PATH, pyenv and
+    /// aliases apply the same way they would in a normal terminal.
+    fn spawn(
+        shell_command: String,
+        active_path: PathBuf,
+        kind: EmbeddedTerminalKind,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<Self> {
         let pty_system = native_pty_system();
 
         let pair = pty_system
@@ -37,65 +48,6 @@ impl EmbeddedTerminal {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let mut command = CommandBuilder::new(shell);
 
-        let editor_command = editor_launch_command(editor, path);
-        command.arg("-lc");
-        command.arg(editor_command);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("ALPNEST_EMBEDDED_TERMINAL", "1");
-
-        let child = pair.slave.spawn_command(command).map_err(to_io_error)?;
-        let writer = pair.master.take_writer().map_err(to_io_error)?;
-        let mut reader = pair.master.try_clone_reader().map_err(to_io_error)?;
-
-        let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let mut buf = [0_u8; 8192];
-
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Self {
-            writer,
-            child,
-            parser: vt100::Parser::new(rows, cols, 2000),
-            rx,
-            active_path: path.to_path_buf(),
-            kind: EmbeddedTerminalKind::Editor,
-        })
-    }
-
-    pub fn spawn_shell(cwd: &Path, cols: u16, rows: u16) -> io::Result<Self> {
-        let pty_system = native_pty_system();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(to_io_error)?;
-
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut command = CommandBuilder::new(&shell);
-
-        let shell_command = format!(
-            "cd {} && exec {} -l",
-            shell_quote_path(cwd),
-            shell_quote(&shell)
-        );
         command.arg("-lc");
         command.arg(shell_command);
         command.env("TERM", "xterm-256color");
@@ -129,9 +81,74 @@ impl EmbeddedTerminal {
             child,
             parser: vt100::Parser::new(rows, cols, 2000),
             rx,
-            active_path: cwd.to_path_buf(),
-            kind: EmbeddedTerminalKind::Shell,
+            active_path,
+            kind,
         })
+    }
+
+    pub fn spawn_editor(editor: &str, path: &Path, cols: u16, rows: u16) -> io::Result<Self> {
+        Self::spawn(
+            editor_launch_command(editor, path),
+            path.to_path_buf(),
+            EmbeddedTerminalKind::Editor,
+            cols,
+            rows,
+        )
+    }
+
+    pub fn spawn_shell(cwd: &Path, cols: u16, rows: u16) -> io::Result<Self> {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+        let shell_command = format!(
+            "cd {} && exec {} -l",
+            shell_quote_path(cwd),
+            shell_quote(&shell)
+        );
+
+        Self::spawn(
+            shell_command,
+            cwd.to_path_buf(),
+            EmbeddedTerminalKind::Shell,
+            cols,
+            rows,
+        )
+    }
+
+    /// Runs `argv` in `cwd` and holds the pane open afterwards so the user can
+    /// read the result. Arguments are shell-quoted individually, so a value
+    /// carrying spaces or quotes cannot inject extra commands.
+    pub fn spawn_task(
+        argv: &[String],
+        cwd: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<Self> {
+        if argv.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot spawn an empty command",
+            ));
+        }
+
+        let quoted = argv
+            .iter()
+            .map(|part| shell_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let shell_command = format!(
+            "cd {} && {}; printf '\\n[alpnest] exit=%s — press enter to close\\n' \"$?\"; read _",
+            shell_quote_path(cwd),
+            quoted
+        );
+
+        Self::spawn(
+            shell_command,
+            cwd.to_path_buf(),
+            EmbeddedTerminalKind::Task,
+            cols,
+            rows,
+        )
     }
 
     pub fn drain_output(&mut self) {
