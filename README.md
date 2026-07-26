@@ -19,8 +19,13 @@ It is built around a filesystem-backed content model and a Ratatui interface. Th
   - [Main explorer](#main-explorer)
   - [Content editor](#content-editor)
   - [Panel wizard](#panel-wizard)
+  - [Cook section](#cook-section)
+  - [Configure mail](#configure-mail)
+  - [Section workbench](#section-workbench)
   - [Settings](#settings)
   - [Reserved views](#reserved-views)
+- [Keybindings](#keybindings)
+- [Themes](#themes)
 - [Filesystem model](#filesystem-model)
 - [Runtime paths](#runtime-paths)
 - [Configuration](#configuration)
@@ -60,6 +65,7 @@ Implemented:
 
 - Ratatui main explorer
 - dynamic content registry backed by the filesystem
+- content types that gate behavior, not just describe it
 - content/panel/section navigation
 - content editor with add/edit/remove modes
 - panel wizard for batch panel creation
@@ -73,9 +79,14 @@ Implemented:
 - cook section view: cook, rename and remove `<section>.md` / `<section>.context.md` pairs
 - configure mail view: multi-account IMAP setup with Keychain-backed credentials
 - multi-account IMAP sync projecting one mail panel per connected account
+- incremental fetch tracking UIDVALIDITY and per-mailbox UID watermarks
 - mail drill-down: each message is a section holding the full original
-- qwen summarization wired into the sync, waking and unloading the model per batch
-- classified IMAP failures with per-provider remedies
+- MIME body parsing, taking text/plain with an HTML fallback
+- summarization wired into the sync, waking and unloading the model per batch
+- selectable summarizer backend (ollama, Anthropic, OpenAI) with behavior
+  pinned across models
+- classified IMAP failures with per-provider remedies and auth backoff
+- background sync at launch plus a LaunchAgent timer
 - section workbench: a standalone working surface per section
 - swappable themes (`nest`, `euporie`, `btop`, `mono`) applied across every view
 
@@ -98,7 +109,7 @@ Alpnest separates UI state from content state.
 app view != content
 ```
 
-An app view is an interaction surface: main explorer, content editor, panel wizard, settings, and future section/mail/calendar views.
+An app view is an interaction surface: main explorer, content editor, panel wizard, cook section, configure mail, section workbench, and settings.
 
 A content is a filesystem-backed work surface: for example school, projects, mail, calendar, job, today, or any other configured top-level area.
 
@@ -119,13 +130,15 @@ Current views:
 - main explorer
 - content editor
 - panel wizard
+- cook section
+- configure mail
+- section workbench
 - settings
 
 Reserved views:
 
-- cook section
-- configure mail
 - calendar-specific surfaces
+- project git surfaces
 - future agentic development surfaces
 
 ### Contents
@@ -164,6 +177,27 @@ A content has:
 - panels
 - order
 - hidden flag
+
+#### Content types drive behavior
+
+The declared `content_type` is not decoration. It decides which operations a
+content admits:
+
+| type | panels are | sections | cook section | build panel | workbench |
+|---|---|---|---|---|---|
+| `minimal` | none | none | — | — | — |
+| `task` | authored units of work | yes | yes | yes | yes |
+| `project` | git repositories | yes | yes | yes | yes |
+| `mail` | connected accounts | messages | no | no | no |
+| `calendar` | daily / weekly | dates | no | no | no |
+
+`mail` and `calendar` are **special contents**. They render their own domain
+surface and are generated from messages and dates rather than authored, so the
+section grammar does not apply to them. Pressing `c` or `b` inside one explains
+why instead of opening a wizard, and opening one of their leaves shows the
+message or the date rather than a task workbench.
+
+Everything else follows the ordinary content → panel → section grammar.
 
 ### Panels
 
@@ -240,14 +274,14 @@ footer:       controls
 Typical controls:
 
 ```text
-j/k            move
-enter          open tree / descend
+j/k            move, wrapping at both ends
+enter          descend, or open a section's workbench
 E              edit selected context markdown
 Ctrl-T         toggle right-pane shell
 a              content editor
 b              panel wizard
-c              cook section placeholder
-m              mail configuration placeholder
+c              cook section
+m              configure mail
 s              settings
 q              quit
 ```
@@ -337,6 +371,49 @@ deadline_enabled = false
 deadline_days = 0
 ```
 
+### Cook section
+
+Opened with `c` from the main explorer, against the currently selected panel.
+Sections are the leaf of the grammar, so this is the view that stops the leaf
+layer from needing hand-edited files.
+
+Three operations:
+
+- **cook** — create `N` sections, each a `<slug>.md` / `<slug>.context.md` pair
+- **edit** — rename a section, moving both files together
+- **remove** — delete the pair, behind a second-`enter` confirmation
+
+Per-section defaults choose whether to write the body, the context, a starter
+template (`blank`, `notes`, `milestones`, `exercise`, `reference`) and a
+deadline. The layout mirrors the panel wizard so the muscle memory carries
+over, and `ctrl-t` flips the preview between full paths and a filetree.
+
+Because this writes into a live panel, the writer refuses slugs that collide
+with the panel's own reserved files (`context`, `prompt`, `panel`), refuses
+names starting with a dot or ending in `.context`, refuses to overwrite on
+rename, and scopes removal to direct children of the panel directory.
+
+### Configure mail
+
+Opened with `m`, or from the settings view. It runs its own palette on purpose:
+configuring an account is a higher-stakes surface than browsing markdown and
+should not look like it.
+
+```text
+accounts list  |  connection form
+provider notes |  mail log
+footer
+```
+
+The form covers display name, provider, email, login name, IMAP host, port,
+security, mailboxes, first-sync and per-sync limits, enabled state, the
+credential row, and the summarizer backend. Actions test the connection, sync
+one account, save, and remove.
+
+Supported providers: GMAIL, MICROSOFT 365 / Exchange Online, ICLOUD, YAHOO,
+generic IMAP, and local Apple Mail. Mail panels are created here and only here
+— you cannot build a panel or cook a section inside mail.
+
 ### Settings
 
 The settings view edits runtime behavior.
@@ -346,7 +423,8 @@ Current settings include:
 - text editor command
 - terminal layout
 - reload after external edit
-- theme placeholder
+- theme, cycling through the four shipped palettes and applying immediately
+- open mail account configuration
 - keymap placeholder
 - agentic development placeholder
 
@@ -356,7 +434,7 @@ Example config:
 text_editor = "vim"
 terminal_layout = "built_in_right_pane"
 reload_after_external_edit = true
-theme = "default"
+theme = "nest"
 keymap = "default"
 agentic_development = false
 ```
@@ -401,6 +479,52 @@ Current reserved directions:
 - project git tracking surfaces
 - local agent handoff and workflow surfaces
 
+## Keybindings
+
+Main explorer:
+
+| key | action |
+|---|---|
+| `j` / `k` | move, wrapping at both ends |
+| `enter` | descend, or open a section's workbench |
+| `E` | edit the context file |
+| `ctrl-t` | toggle the right-pane terminal |
+| `a` | add / edit content |
+| `b` | build panels |
+| `c` | cook sections |
+| `m` | configure mail |
+| `s` | settings |
+| `q`, `ctrl-q`, `ctrl-c` | quit |
+
+`ctrl-q` and `ctrl-c` quit from anywhere, including inside a wizard, so there
+is always one way out that does not depend on which view has focus.
+
+Every other binding is an unmodified key. Keys carrying `ctrl` or `alt` that a
+handler does not claim are dropped rather than falling through to the bare
+letter arm — without that guard, `ctrl-a` opened the content editor and
+`ctrl-x` typed an `x` into a text field.
+
+Each wizard renders its own footer with its local controls.
+
+## Themes
+
+Four themes ship, cycled from the settings view and applied on the next frame:
+
+| name | character |
+|---|---|
+| `nest` | default; saturated accents on a deep neutral base |
+| `euporie` | soft, low-chroma, generous dim text |
+| `btop` | high contrast, for bright terminals and screenshots |
+| `mono` | no colour, for plain terminals |
+
+Configure Mail additionally runs a separate amber palette that is not in the
+user cycle, because account configuration should not look like note browsing.
+
+Views never hardcode a colour; they ask the theme. That is what makes the
+palette swappable and lets mail run its own. The shared helpers cover bordered
+blocks that brighten on focus, filled selection rows, checkboxes, field rows,
+status badges, and footer key chips.
+
 ## Filesystem model
 
 The source repository may contain generic defaults, but user runtime data is resolved separately.
@@ -411,6 +535,8 @@ A typical runtime tree looks like:
 ALPNEST_HOME/
   config/
     alpnest.toml
+    mail/
+      accounts.cfg          connection metadata + summarizer choice, no secrets
   contents/
     school/
       deep-learning/
@@ -425,11 +551,36 @@ ALPNEST_HOME/
     projects/
       alpnest/
       iot-lab/
-    mail/
-    calendar/
+    10-mail/
+      .mail.cfg
+      overview.md           combined digest, the content's own body
+      kit/                  one directory per connected account
+        000-overview.md     summarized message list
+        001-<date>-<subject>-<hash>.md          full original message
+        001-<date>-<subject>-<hash>.context.md  its summary and triage
+      gmail/
+    20-calendar/
   drafts/
+  raw/mail/messages/        fetched bodies, keyed by message id
+  store/
+    messages.json           every message ever fetched
+    eventstreams.json       grouped streams the summarizer reads
+    mail_sync_state.json    per-mailbox UID watermark and auth backoff
   generated/
+  logs/
 ```
+
+Mail panels are exactly the account directories. Loose markdown at the mail
+root is deliberately not promoted to a panel, so the combined digest in
+`overview.md` shows when `Mail` itself is selected without appearing as a
+fake account beside the real ones.
+
+A leading `NN-` on a section file sets its sort order and is stripped from the
+display title, the same convention top-level contents already use for
+`00-today`. Generated mail sections use it to keep the summary list pinned
+first and messages newest-first. A section also takes its display title from
+its own `# heading` when it has one, which is what makes a generated message
+read as its subject rather than as its filename.
 
 The registry loads visible content from the configured content root. Dotfiles and manifests are used for metadata but are not shown as normal sections.
 
@@ -467,6 +618,19 @@ cargo run
 ```
 
 without exporting `ALPNEST_HOME` every time.
+
+Note that `~/Library` is hidden in Finder and macOS shows localized folder
+names, so the directory can look absent even though it exists. To inspect it:
+
+```sh
+open ~/Library/Application\ Support/alpnest
+```
+
+The Python helpers resolve the same root through `scripts/paths.py`. They
+previously hardcoded `~/.local/share/alpnest` while the app read
+`~/Library/Application Support/alpnest`, which meant the sync wrote output the
+TUI never read. Both sides now agree; `ALPNEST_DATA_HOME` still overrides the
+store location if you need them apart.
 
 ## Configuration
 
@@ -510,6 +674,52 @@ They should not store volatile runtime state such as:
 
 Volatile state belongs under generated runtime directories.
 
+### Mail configuration
+
+`$ALPNEST_HOME/config/mail/accounts.cfg` is written by the Configure Mail view:
+
+```text
+[summarizer]
+provider = "ollama"          # ollama | anthropic | openai
+model = "qwen3:8b"
+
+[account.kit]
+display_name = "KIT"
+provider = "imap"
+email = "someone@student.kit.edu"
+username = "someone"         # login name when it differs from the address
+imap_host = "imap.kit.edu"
+imap_port = 993
+security = "ssl"             # ssl | starttls
+mailboxes = "INBOX"
+initial_limit = 20           # messages pulled on the first sync
+batch_limit = 10             # ceiling per later pass
+enabled = true
+```
+
+This file holds connection metadata only. There is a test asserting that a
+serialized account block contains no `password`, `token` or `secret` key.
+
+### Secrets
+
+Alpnest never accepts, holds, or stores a password. It asks the macOS Keychain
+two things: whether a secret exists for an account id, and to prompt the user
+to set one. Selecting the credential row spawns
+
+```sh
+security add-generic-password -U -a <account> -s alpnest-mail -l "…" -w
+```
+
+in the right pane, so macOS does the prompting. `-w` carries no value, which is
+what makes it interactive rather than passing a secret on the command line. The
+sync helper reads the value from the Keychain at fetch time and never writes it
+anywhere.
+
+| purpose | Keychain service | account |
+|---|---|---|
+| mail password | `alpnest-mail` | `<account id>` |
+| summarizer API key | `alpnest-mail` | `summarizer:<provider>` |
+
 ## Embedded terminal
 
 Alpnest includes a PTY-backed right-pane terminal.
@@ -541,268 +751,156 @@ Known limitations:
 
 ## Mail pipeline
 
-Alpnest has a local-first mail pipeline for multi-account mail ingestion, deterministic triage, Qwen-backed summarization, and generated TUI surfaces.
-
-Mail is not modeled as a direct IMAP client inside the TUI. The current design separates the pipeline into small stages:
-
-```text
-Apple Mail / local mail source
-  -> local sync/fetch script
-  -> messages.json + eventstreams.json
-  -> deterministic filters and fallback classification
-  -> optional Qwen summarization through Ollama
-  -> generated markdown mail views
-  -> Alpnest content/view surfaces
-```
-
-The pipeline is intentionally staged. Fetching mail, storing raw/local state, grouping messages into event streams, filtering noise, summarizing with a model, and rendering markdown are separate operations. This keeps failures debuggable and allows each stage to be replaced independently.
-
-### Mail storage model
-
-The Python mail scripts use the local Alpnest data home:
+Mail is fetched over IMAP, stored locally, summarized by a model, and projected
+as markdown that the ordinary content registry reads. Every stage is separate so
+failures stay debuggable and any stage can be replaced independently.
 
 ```text
-~/.local/share/alpnest/
-  raw/mail/messages/          raw fetched message bodies
-  store/messages.json         normalized message records
-  store/eventstreams.json     sender/subject grouped mail streams
-  store/mail_sync_state.json  sync metadata
-  generated/mail.md           generated mail overview
-  generated/mail_<account>.md generated account-specific views
-  generated/mail_decomposition.md
+IMAP accounts (GMAIL, MICROSOFT, ICLOUD, YAHOO, generic)
+  -> scripts/sync_mail_imap.py        incremental, read-only fetch
+  -> store/messages.json              full history
+  -> store/eventstreams.json          grouped streams
+  -> scripts/summarize_mail_local.py  prompt pack + selectable backend
+  -> contents/<mail>/<account>/       one section per message
+  -> Alpnest main explorer
 ```
 
-The current sync path is Apple Mail oriented. `scripts/sync_mail_apple.py` syncs recent Apple Mail messages into the local store. The script models messages as normalized `Message` records and groups them into sender/subject event streams. Metadata-only sync is supported by default, while full body fetching is optional because Apple Mail body extraction through AppleScript can be slow on long or HTML-heavy mail.
+### Read-only by construction
 
-The pipeline tracks multiple accounts. The renderer currently orders known account surfaces such as `kit`, `gmail`, `icloud`, and `unknown`, and writes one account-specific digest per account in addition to the main mail overview.
+Syncing can never mutate the server or your mail state:
 
-### Deterministic filtering
+- mailboxes are selected with `readonly=True`
+- every fetch uses `BODY.PEEK`, so messages are not marked as read
+- nothing is ever deleted, moved, or flagged
 
-Before model summarization becomes useful, obvious noise needs to be filtered deterministically. Alpnest uses `scripts/mail_filters.cfg` for mute/filter rules. These rules affect generated Alpnest projections only; they do not delete real mail, raw body files, `messages.json`, or `eventstreams.json`.
+### Incremental fetch
 
-The filter layer handles sender, subject, body, and summary patterns. It is used for low-value streams such as social notifications, newsletters, shopping/promotional mail, product marketing, webinar mail, and other account-only or hidden items.
+IMAP UIDs are monotonic within a mailbox while `UIDVALIDITY` is stable, so the
+sync records the highest UID it has seen per mailbox in
+`store/mail_sync_state.json` and asks the server for `UID last+1:*` on every
+later pass. Consequences:
 
-The summarizer also has deterministic category and attention fallback logic for common patterns such as school, assignment, exam, lab, seminar, meeting, GitHub, security, event, application, newsletter, promotion, and unknown mail.
+- already-fetched mail is never downloaded twice
+- the store is the history; new mail merges in and nothing is dropped
+- a `UIDVALIDITY` change is detected and triggers a clean resync
+- `--reset` forgets the watermark when you want a deliberate refetch
 
-### Qwen summarization
+Per-account volume is bounded by two numbers, both editable in the Configure
+Mail view: `initial_limit` (default 20) for the first sync of a mailbox, and
+`batch_limit` (default 10) as the ceiling for each later pass. The second one
+matters because the sync runs on a one-minute timer; it stops a single tick
+from handing the summarizer an unbounded pile of work.
 
-The local summarization script is `scripts/summarize_mail_local.py`.
+### Message bodies
 
-It uses a prompt pack under:
+With `--bodies` the sync pulls the whole message and walks the parsed MIME tree,
+taking `text/plain` and falling back to stripped HTML, skipping attachments.
+Fetching `BODY.PEEK[TEXT]` instead returns the raw multipart envelope —
+boundaries, per-part headers, base64 — which is unreadable and useless as
+summary input.
+
+Cached bodies are always rewritten rather than skipped when present, so an
+improved parser can correct a body captured by an earlier one.
+
+### Error handling
+
+IMAP servers report auth problems as opaque blobs like
+`b'[ALERT] Application-specific password required: https://...'`.
+`scripts/mail_errors.py` classifies the common cases and prints a remedy:
+
+| code | cause |
+|---|---|
+| `app_password_required` | GMAIL needs an App Password, never the account password |
+| `invalid_credentials` | the stored secret is wrong |
+| `microsoft_basic_auth` | tenant may require OAuth2 |
+| `auth_failed` | IMAP disabled, or wrong address |
+| `tls_failure` | wrong security mode, or a proxy breaking validation |
+| `dns_failure` | host misspelled, or a VPN is required |
+| `unreachable` | network, port, or firewall |
+| `mailbox_missing` | mailbox name does not exist on this server |
+
+Auth failures are not transient: a wrong app password fails identically every
+time. On a per-minute timer that would be roughly 1,400 rejected logins a day,
+which providers treat as an attack. A rejected credential therefore backs off
+for 30 minutes, cleared automatically by a successful `--test`.
+
+### Automation
+
+`scripts/alpnest-mail-agent.sh` installs a LaunchAgent that syncs on a timer:
+
+```sh
+./scripts/alpnest-mail-agent.sh install 60
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.alpblkba.alpnest.mail.plist
+```
+
+`install` writes the plist and prints the load command rather than loading it
+for you. `status` and `uninstall` do what they say.
+
+Alpnest also starts one sync when it launches, detached, so opening the app
+shows current mail without blocking the TUI on the network. The registry
+reloads when the child exits.
+
+A lock in `store/sync.lock` prevents overlapping passes, since the agent can
+fire while a manual run or a slow summarization is still going.
+
+### Summarization
+
+The summarizer is a **prompt contract, not a fine-tune**. Seven files under
+`prompts/qwen/mail_summarizer/` are concatenated into every request:
 
 ```text
-prompts/qwen/mail_summarizer/
-  system.md
-  context.md
-  task.md
-  output_schema.md
-  rubric.md
-  examples.md
-  failure_modes.md
+system.md  context.md  task.md  output_schema.md
+rubric.md  examples.md  failure_modes.md
 ```
 
-The current default model is:
+The model's role is deliberately narrow. It is not a planner, scheduler, or
+assistant. It converts one email into a compact JSON digest while preserving
+visible facts: it cleans sender and subject for display, summarizes in one or
+two sentences, preserves explicit actions and deadlines, classifies into one
+allowed category, chooses an attention target and importance, and marks
+`needs_human_review` rather than guessing.
 
-```text
-qwen3:8b
-```
+### Selectable backend, fixed behavior
 
-The model is called through Ollama's local HTTP API:
+The model is selectable from the Configure Mail view; the behavior is not.
 
-```text
-http://localhost:11434/api/generate
-```
+| provider | default model | credential |
+|---|---|---|
+| `ollama` | `qwen3:8b` | none, local |
+| `anthropic` | `claude-sonnet-5` | Keychain `summarizer:anthropic` |
+| `openai` | `gpt-4o-mini` | Keychain `summarizer:openai` |
 
-The request uses:
+Determinism across backends is enforced structurally rather than by convention.
+Every provider receives the same prompt pack, is pinned to **temperature 0**,
+and must return an object matching the same JSON schema. The result then runs
+through identical category, attention, importance and retention normalisation,
+plus the same deterministic fallbacks.
 
-```text
-model: qwen3:8b
-stream: false
-think: false
-temperature: 0.1
-format: JSON schema
-```
+Swapping models can change how well a summary reads. It cannot change the data
+shape, the allowed vocabulary, or what Alpnest does with the result.
 
-The summarizer sends a compact prompt containing the prompt pack plus one mail payload. The payload includes account, sender, subject, received time, body status, and either the fetched body, snippet, or metadata-only fallback. Bodies are capped before prompting so that long or HTML-heavy messages do not dominate the prompt.
+### Model wake and sleep
 
-The Qwen role is deliberately narrow. It is not a planner, project manager, scheduler, or general assistant. Its job is to convert one email or event stream into a compact JSON digest while preserving visible facts.
+A local model must not idle resident between one-minute syncs:
 
-The prompt contract requires the model to:
+1. before contacting anything, the summarizer counts how many streams actually
+   need work; if none, it exits without a single HTTP call
+2. if the backend is unreachable, it degrades to the deterministic fallback
+3. after the batch it unloads with `keep_alive: 0`, inside a `finally` so a
+   crash cannot leave several GB resident
 
-- clean sender and subject for display
-- summarize in one or two short English sentences
-- preserve explicit actions
-- preserve explicit deadlines, dates, times, locations, course names, assignment names, exam names, lab names, and seminar names
-- classify the mail into one allowed category
-- choose an attention target: `overview`, `account_only`, or `hidden`
-- choose importance: `high`, `medium`, or `low`
-- provide retention hints such as `24h`, `3d`, `7d`, `until_deadline`, `keep`, or `hidden`
-- mark `needs_human_review` when the message may matter but the payload is incomplete or ambiguous
-- avoid guessing missing actions, deadlines, senders, courses, meetings, or importance
-- output JSON only
+Progress is checkpointed to `eventstreams.json` every five streams, so a long
+backlog survives interruption.
 
-### Summary schema
+### Deterministic filtering and fallback
 
-The summarizer writes normalized fields back into `eventstreams.json`.
+Independently of any model, the summarizer applies sender/subject/body filters
+from `scripts/mail_filters.cfg` and deterministic category, attention and
+importance rules for common patterns — school, assignment, exam, lab, seminar,
+meeting, GitHub, security, event, application, newsletter, promotion.
 
-Important fields include:
-
-```text
-display_sender
-display_subject
-summary_local
-category_guess
-attention / attention_guess
-importance / importance_guess
-action_required
-action
-deadline
-date_or_time
-retention_hint
-source_language
-summary_language
-noise_guess
-needs_human_review
-summary_confidence
-summary_source
-summary_updated_at
-```
-
-The model-facing JSON schema includes:
-
-```json
-{
-  "display_sender": "string",
-  "display_subject": "string",
-  "summary": "string",
-  "category": "school|admin|assignment|exam|lab|seminar|research|project|work|career|application|meeting|event|calendar|security|finance|travel|github|tool|newsletter|promotion|shopping|social|noise|unknown",
-  "attention": "overview|account_only|hidden",
-  "importance": "high|medium|low",
-  "action_required": false,
-  "action": null,
-  "deadline": null,
-  "date_or_time": null,
-  "retention_hint": "24h|3d|7d|until_deadline|keep|hidden",
-  "source_language": "tr|en|de|mixed|unknown",
-  "summary_language": "en",
-  "noise": false,
-  "needs_human_review": false,
-  "confidence": 0.0
-}
-```
-
-The schema is enforced in two places: the prompt pack specifies the expected output contract, and the Ollama request passes a JSON schema through the `format` field. The Python layer still validates and normalizes the model output because local models can produce invalid, incomplete, or overconfident responses.
-
-### Fallback behavior
-
-Qwen summarization is optional. The summarizer can run with deterministic fallback only:
-
-```sh
-python3 scripts/summarize_mail_local.py --no-ollama
-```
-
-Fallback mode is also used when:
-
-- Ollama is unavailable
-- the model times out
-- the response is not valid JSON
-- the message is obvious deterministic noise
-- only metadata is available and the script can produce a safer limited digest
-
-Fallback summaries use visible sender, subject, snippet, fetched body excerpts when available, deterministic category hints, attention inference, retention inference, and conservative confidence values.
-
-### Rendering generated mail views
-
-`/scripts/generate_mail_view.py` renders readable markdown from the local mail store.
-
-It writes:
-
-```text
-generated/mail.md
-```
-
-and one account-specific view per account:
-
-```text
-generated/mail_kit.md
-generated/mail_gmail.md
-generated/mail_icloud.md
-generated/mail_unknown.md
-```
-
-The renderer groups streams by account, computes account stats, hides likely noise from the main overview, and keeps account-specific digests available for browsing. Stream badges expose useful status such as category, summarized/body/metadata source, human-review marker, action marker, and deadline marker.
-
-`/scripts/generate_mail_decomposition.py` writes a more detailed local snapshot to:
-
-```text
-generated/mail_decomposition.md
-```
-
-That file is not the LLM integration. It is a readable decomposition/debug artifact for inspecting messages, event stream metadata, body status, payload hashes, snippets, sync state, and placeholders for future task decomposition.
-
-### Typical commands
-
-Sync mail from Apple Mail:
-
-```sh
-python3 scripts/sync_mail_apple.py
-```
-
-Summarize recent streams with the default local Qwen model:
-
-```sh
-python3 scripts/summarize_mail_local.py
-```
-
-Summarize more streams:
-
-```sh
-python3 scripts/summarize_mail_local.py --limit 50
-```
-
-Force resummarization:
-
-```sh
-python3 scripts/summarize_mail_local.py --force
-```
-
-Use a different Ollama model:
-
-```sh
-python3 scripts/summarize_mail_local.py --model qwen3:14b
-```
-
-Run deterministic fallback only:
-
-```sh
-python3 scripts/summarize_mail_local.py --no-ollama
-```
-
-Render markdown mail views:
-
-```sh
-python3 scripts/generate_mail_view.py
-```
-
-Render the debug decomposition snapshot:
-
-```sh
-python3 scripts/generate_mail_decomposition.py
-```
-
-Run the wrapper:
-
-```sh
-scripts/alpnest-mail-sync.sh
-```
-
-### Design constraints
-
-The mail pipeline should not store credentials or provider tokens in content manifests. Mail credentials belong in the user's mail client, keychain, environment, or another dedicated secret mechanism.
-
-Generated summaries are runtime artifacts. They belong in local generated state, not in `.cfg` manifests.
-
-The mail backend is separate from the generic content registry. The registry can show generated mail views, but syncing, filtering, summarization, and rendering remain independent pipeline stages.
+This is why `--no-ollama` still produces usable triage, and why the pipeline
+keeps working when no model is available at all.
 
 ## Build and run
 
@@ -862,6 +960,59 @@ Run the mail sync wrapper:
 
 ```sh
 scripts/alpnest-mail-sync.sh
+```
+
+### Mail commands
+
+Verify credentials and mailbox access without fetching or writing:
+
+```sh
+python3 scripts/sync_mail_imap.py --all --test
+```
+
+Note this exits non-zero if *any* account fails, so do not chain it with `&&`
+before a real sync.
+
+Fetch and summarize:
+
+```sh
+python3 scripts/sync_mail_imap.py --all --bodies --summarize
+```
+
+| flag | effect |
+|---|---|
+| `--account <id>` / `--all` | scope |
+| `--test` | connect only, no writes |
+| `--bodies` | fetch message bodies, needed for full-detail sections |
+| `--summarize` | run the summarizer afterwards |
+| `--reset` | forget UID state and refetch from scratch |
+| `--watch --interval N` | foreground loop instead of the LaunchAgent |
+
+Summarize on its own, optionally overriding the configured backend:
+
+```sh
+python3 scripts/summarize_mail_local.py --limit 20 --unload
+python3 scripts/summarize_mail_local.py --provider anthropic --limit 20
+python3 scripts/summarize_mail_local.py --no-ollama
+```
+
+Manage the background timer:
+
+```sh
+scripts/alpnest-mail-agent.sh install 60
+scripts/alpnest-mail-agent.sh status
+scripts/alpnest-mail-agent.sh uninstall
+```
+
+### Test content
+
+Seed three throwaway School panels with five sections each, ordered after the
+real courses. Removal only deletes files carrying the generator's marker, so
+anything hand-edited inside a seeded panel survives:
+
+```sh
+python3 scripts/seed_test_content.py --seed
+python3 scripts/seed_test_content.py --remove
 ```
 
 ## Registry debugging
@@ -945,6 +1096,46 @@ Important decisions:
 - `Ctrl-S` is the explicit save/build action
 - filetree preview should eventually show all real files in the panel, including sections
 
+### Section workbench
+
+Boards were rejected as the model. A Trello-style board makes you maintain
+containers, and the real state ends up in a database reachable only through the
+UI — the wrong shape for a markdown-backed terminal tool.
+
+Important decisions:
+
+- steps are the checkboxes already in the section's markdown; there is no
+  second source of truth to keep in sync
+- toggling rewrites exactly one line, preserving every other byte including a
+  missing trailing newline
+- the first unfinished step is pinned, so the view answers "what next" rather
+  than showing a wall of containers
+- a section with no checkboxes explains how to add them instead of rendering
+  an empty pane
+
+### Mail as a special content
+
+Important decisions:
+
+- `ContentType` gates behavior rather than being metadata; mail and calendar
+  admit no sections, no built panels and no workbench
+- mail panels are exactly the account directories, so loose markdown at the
+  mail root is never promoted to a fake account
+- each message is a section holding the unmodified original, with the model's
+  digest in the paired context file
+- summarization is a prompt contract, and determinism across backends is
+  enforced by pinning temperature, schema and normalisation rather than by
+  trusting the model
+
+### Credential handling
+
+Important decisions:
+
+- Alpnest never accepts, holds, or stores a secret
+- macOS does the prompting through an interactive `security` invocation
+- config files carry connection metadata only, asserted by a test
+- a rejected credential backs off rather than retrying every minute
+
 ## Roadmap
 
 Near-term:
@@ -958,7 +1149,8 @@ Near-term:
 - improve embedded terminal rendering
 - strengthen typed manifest parsing
 - OAuth2 device flow for Microsoft tenants that block basic auth
-- incremental IMAP sync using stored UIDVALIDITY/UIDNEXT
+- account-aware noise filters, so routine notifications skip the model
+  entirely rather than costing a summarization each
 
 Later:
 
