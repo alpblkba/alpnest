@@ -51,6 +51,7 @@ pub struct SectionWorkbench {
     pub selected_step: usize,
     pub focus: WorkbenchFocus,
     pub body_scroll: u16,
+    pub show_local_draft: bool,
     pub status: Option<String>,
     pub loaded: bool,
 }
@@ -115,6 +116,26 @@ impl SectionWorkbench {
                  create `<section>.context.md` beside the body."
                     .to_string()
             }
+        }
+    }
+
+    pub fn local_draft_path(&self) -> PathBuf {
+        crate::local_llm::draft_path(&self.body_path)
+    }
+
+    pub fn local_draft_text(&self) -> Option<String> {
+        fs::read_to_string(self.local_draft_path()).ok()
+    }
+
+    pub fn toggle_brief_source(&mut self) {
+        if self.show_local_draft {
+            self.show_local_draft = false;
+            self.status = Some("showing section context".to_string());
+        } else if self.local_draft_path().is_file() {
+            self.show_local_draft = true;
+            self.status = Some("showing local draft".to_string());
+        } else {
+            self.status = Some("no local draft yet — press a to create one".to_string());
         }
     }
 
@@ -258,6 +279,15 @@ impl SectionWorkbench {
                 "attached".to_string()
             } else {
                 "none".to_string()
+            },
+        ));
+
+        rows.push((
+            "local draft".to_string(),
+            if self.local_draft_path().is_file() {
+                "ready; press v to view".to_string()
+            } else {
+                "not generated".to_string()
             },
         ));
 

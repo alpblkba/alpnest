@@ -631,7 +631,7 @@ def update_eventstreams(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
-def run_summarizer(model: str, limit: int) -> None:
+def run_summarizer(model: str | None, limit: int) -> None:
     """Delegate to the existing prompt-pack summarizer.
 
     That script owns the Ollama wake/sleep discipline: it contacts Ollama only
@@ -643,10 +643,11 @@ def run_summarizer(model: str, limit: int) -> None:
         print("  ! summarizer not found; skipping", file=sys.stderr)
         return
 
-    result = subprocess.run(
-        [sys.executable, str(script), "--model", model, "--limit", str(limit), "--unload"],
-        check=False,
-    )
+    command = [sys.executable, str(script), "--limit", str(limit), "--unload"]
+    if model:
+        command.extend(["--model", model])
+
+    result = subprocess.run(command, check=False)
 
     if result.returncode != 0:
         print("  ! summarizer exited non-zero; continuing with existing summaries", file=sys.stderr)
@@ -985,7 +986,7 @@ def sync_once(
     accounts: list[MailAccount],
     with_bodies: bool,
     summarize: bool,
-    model: str,
+    model: str | None,
 ) -> int:
     fetched: list[dict[str, Any]] = []
     failures = 0
@@ -1070,7 +1071,10 @@ def main() -> int:
         action="store_true",
         help="run the local qwen summarizer after fetching",
     )
-    parser.add_argument("--model", default="qwen3:8b", help="ollama model for summarization")
+    parser.add_argument(
+        "--model",
+        help="override the model configured in accounts.cfg",
+    )
     parser.add_argument(
         "--reset",
         action="store_true",

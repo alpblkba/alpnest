@@ -33,12 +33,11 @@ impl ContentType {
         }
     }
 
-    /// Mail and calendar are *special* contents: they render their own domain
-    /// surface (messages, dates) and do not participate in the section
-    /// grammar. Nothing may cook a section into them, and opening one of their
-    /// leaves must not present a task workbench.
+    /// Minimal content stops at overview/context. Mail and calendar render
+    /// their own domain surfaces and also do not use the authored section
+    /// grammar.
     pub fn has_sections(self) -> bool {
-        !matches!(self, Self::Mail | Self::Calendar)
+        !matches!(self, Self::Minimal | Self::Mail | Self::Calendar)
     }
 }
 
@@ -109,8 +108,8 @@ mod type_tests {
     fn authored_contents_have_sections() {
         assert!(ContentType::Task.has_sections());
         assert!(ContentType::Project.has_sections());
-        assert!(ContentType::Minimal.has_sections());
         assert!(ContentType::Unknown.has_sections());
+        assert!(!ContentType::Minimal.has_sections());
     }
 
     #[test]

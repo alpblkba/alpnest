@@ -373,9 +373,7 @@ impl MailConfigState {
         }
 
         let Some(script) = sync_script_path() else {
-            self.log_error(
-                "sync_mail_imap.py not found; set ALPNEST_REPO to your alpnest checkout",
-            );
+            self.log_error("mail sync helper is missing; run `alpnest doctor`");
             return MailConfigAction::None;
         };
 
@@ -408,9 +406,7 @@ impl MailConfigState {
         }
 
         let Some(script) = sync_script_path() else {
-            self.log_error(
-                "sync_mail_imap.py not found; set ALPNEST_REPO to your alpnest checkout",
-            );
+            self.log_error("mail sync helper is missing; run `alpnest doctor`");
             return MailConfigAction::None;
         };
 
@@ -809,8 +805,8 @@ impl MailConfigState {
 ///
 /// Alpnest is usually launched from somewhere other than its own checkout
 /// (`~/.cargo/bin/alpnest`), so a relative `scripts/...` path would not
-/// resolve. `ALPNEST_REPO` wins, then the working directory, then the
-/// checkout inferred from the running executable's location.
+/// resolve. An explicit checkout wins for development; installed builds use
+/// the helper bundle extracted under `ALPNEST_HOME/runtime` at startup.
 pub fn sync_script_path() -> Option<String> {
     const SCRIPT: &str = "scripts/sync_mail_imap.py";
 
@@ -830,6 +826,12 @@ pub fn sync_script_path() -> Option<String> {
         if let Some(root) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
             candidates.push(root.join(SCRIPT));
         }
+    }
+
+    if let Ok(paths) = crate::paths::AlpnestPaths::resolve()
+        && let Some(path) = crate::bootstrap::runtime_script_path(&paths, "sync_mail_imap.py")
+    {
+        candidates.push(path);
     }
 
     candidates

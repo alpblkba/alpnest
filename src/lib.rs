@@ -1,6 +1,8 @@
 pub mod app;
 pub mod app_view;
+pub mod bootstrap;
 pub mod content;
+pub mod local_llm;
 pub mod mail;
 pub mod paths;
 pub mod theme;

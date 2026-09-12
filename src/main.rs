@@ -599,6 +599,8 @@ impl RuntimeApp {
                 }
             }
             KeyCode::Char('n') => self.state.section_workbench.jump_to_next_action(),
+            KeyCode::Char('a') => self.generate_local_section_draft(),
+            KeyCode::Char('v') => self.state.section_workbench.toggle_brief_source(),
             KeyCode::Char('r') => {
                 self.state.section_workbench.reload();
                 self.state.section_workbench.status = Some("reloaded from disk".to_string());
@@ -616,6 +618,30 @@ impl RuntimeApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn generate_local_section_draft(&mut self) {
+        let workbench = &self.state.section_workbench;
+        let command = alpnest::local_llm::draft_command(
+            &workbench.body_path,
+            workbench.context_path.as_deref(),
+            workbench.prompt_path.as_deref(),
+        );
+
+        match command {
+            Ok(argv) => {
+                self.state.section_workbench.show_local_draft = true;
+                self.state.section_workbench.status = Some(format!(
+                    "asking local model {}",
+                    alpnest::local_llm::configured_model()
+                ));
+                self.queue_task("local section draft".to_string(), argv);
+            }
+            Err(error) => {
+                self.state.section_workbench.status =
+                    Some(format!("local draft could not start: {error}"));
+            }
         }
     }
 
@@ -1227,7 +1253,7 @@ impl RuntimeApp {
         let editor = &self.state.content_editor;
 
         let mut option_lines = vec![
-            Line::from(Span::styled("add / edit content", theme.heading())),
+            Line::from(Span::styled("add / remove content", theme.heading())),
             Line::from(""),
         ];
 
@@ -1603,6 +1629,8 @@ impl RuntimeApp {
             ("tab", "steps/body"),
             ("e", "edit body"),
             ("c", "edit context"),
+            ("a", "draft"),
+            ("v", "brief/draft"),
             ("ctrl-t", "terminal"),
             ("r", "reload"),
             ("esc", "back"),
@@ -1771,11 +1799,22 @@ impl RuntimeApp {
 
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(9)])
+            .constraints([Constraint::Min(6), Constraint::Length(10)])
             .split(area);
 
-        let brief = Paragraph::new(markdown_lines(&workbench.context_text(), theme))
-            .block(theme.block("brief", false))
+        let (brief_title, brief_text) = if workbench.show_local_draft {
+            (
+                "local draft",
+                workbench.local_draft_text().unwrap_or_else(|| {
+                    "# Local draft\n\nGenerating, or no draft has been written yet.".to_string()
+                }),
+            )
+        } else {
+            ("brief", workbench.context_text())
+        };
+
+        let brief = Paragraph::new(markdown_lines(&brief_text, theme))
+            .block(theme.block(brief_title, false))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(brief, split[0]);
@@ -2229,6 +2268,17 @@ fn markdown_line(line: &str, theme: Theme) -> Line<'static> {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
+
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("doctor" | "--doctor")
+    ) {
+        if !alpnest::local_llm::print_doctor()? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();

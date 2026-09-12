@@ -30,6 +30,7 @@ It is built around a filesystem-backed content model and a Ratatui interface. Th
 - [Runtime paths](#runtime-paths)
 - [Configuration](#configuration)
 - [Embedded terminal](#embedded-terminal)
+- [Local LLM](#local-llm)
 - [Mail pipeline](#mail-pipeline)
 - [Build and run](#build-and-run)
 - [Development commands](#development-commands)
@@ -64,10 +65,12 @@ The main design principles are:
 Implemented:
 
 - Ratatui main explorer
+- automatic first-run content and runtime initialization
+- `alpnest doctor` checks Python, Ollama, and the configured local model
 - dynamic content registry backed by the filesystem
 - content types that gate behavior, not just describe it
 - content/panel/section navigation
-- content editor with add/edit/remove modes
+- content editor with add/remove modes; body and context editing stays in Markdown
 - panel wizard for batch panel creation
 - panel display titles loaded from `.panel.cfg`
 - per-panel defaults for generated files
@@ -88,6 +91,7 @@ Implemented:
 - classified IMAP failures with per-provider remedies and auth backoff
 - background sync at launch plus a LaunchAgent timer
 - section workbench: a standalone working surface per section
+- reviewable local-model drafts from the section workbench
 - swappable themes (`nest`, `euporie`, `btop`, `mono`) applied across every view
 
 Partially implemented or reserved:
@@ -296,11 +300,12 @@ Modes:
 
 ```text
 add new content
-edit existing content
 remove existing content
 ```
 
 Content creation is intentionally less complex than panel creation. A content is a broad category. Most repeated structure work is expected to happen through panels and sections.
+Existing body and context files are edited directly with `e` / `E`; metadata
+editing is not exposed until it can be implemented without unsafe path moves.
 
 ### Panel wizard
 
@@ -465,9 +470,14 @@ footer
 - `n` jumps to the next action
 - `tab` switches between the steps rail and the body
 - `e` edits the body, `c` edits the context, `ctrl-t` opens a terminal
+- `a` asks the local Ollama model for a separate draft
+- `v` switches the right column between section context and the local draft
 - `r` reloads from disk after an external edit
 
-Sections with no checkboxes show how to add them rather than an empty pane.
+The model never rewrites the section. It writes a hidden
+`.<section>.llm-draft.md` beside it, so the user reviews and applies any useful
+parts. Sections with no checkboxes show how to add them rather than an empty
+pane.
 
 ### Reserved views
 
@@ -489,7 +499,7 @@ Main explorer:
 | `enter` | descend, or open a section's workbench |
 | `E` | edit the context file |
 | `ctrl-t` | toggle the right-pane terminal |
-| `a` | add / edit content |
+| `a` | add / remove content |
 | `b` | build panels |
 | `c` | cook sections |
 | `m` | configure mail |
@@ -537,6 +547,9 @@ ALPNEST_HOME/
     alpnest.toml
     mail/
       accounts.cfg          connection metadata + summarizer choice, no secrets
+  runtime/                  product-owned helpers extracted from the binary
+    scripts/
+    prompts/
   contents/
     school/
       deep-learning/
@@ -551,7 +564,10 @@ ALPNEST_HOME/
     projects/
       alpnest/
       iot-lab/
-    10-mail/
+      inbox/
+        first-steps.md
+        .first-steps.llm-draft.md  generated, review-only local-model output
+    mail/
       .mail.cfg
       overview.md           combined digest, the content's own body
       kit/                  one directory per connected account
@@ -576,8 +592,7 @@ root is deliberately not promoted to a panel, so the combined digest in
 fake account beside the real ones.
 
 A leading `NN-` on a section file sets its sort order and is stripped from the
-display title, the same convention top-level contents already use for
-`00-today`. Generated mail sections use it to keep the summary list pinned
+display title; top-level contents support the same convention. Generated mail sections use it to keep the summary list pinned
 first and messages newest-first. A section also takes its display title from
 its own `# heading` when it has one, which is what makes a generated message
 read as its subject rather than as its filename.
@@ -618,6 +633,12 @@ cargo run
 ```
 
 without exporting `ALPNEST_HOME` every time.
+
+On the first launch, an empty home receives small `Today`, `Projects`, and
+`Mail` starter surfaces. Initialization never adds defaults to a non-empty
+content directory and never overwrites user-authored content. Product-owned
+Python helpers and prompts are embedded in the binary and refreshed under
+`runtime/`, so an installed binary does not depend on a source checkout.
 
 Note that `~/Library` is hidden in Finder and macOS shows localized folder
 names, so the directory can look absent even though it exists. To inspect it:
@@ -748,6 +769,32 @@ Known limitations:
 - mouse forwarding is not complete
 - Vim split handling is functional but not as smooth as a native terminal
 - a future renderer should move closer to cell-grid terminal rendering
+
+## Local LLM
+
+The first active local-model workflow lives in the section workbench. Press
+`a` to send the current section body, its context, and the panel's `.prompt.md`
+to Ollama on `127.0.0.1`. The default model is `qwen3:8b`; override it without
+changing files:
+
+```sh
+ALPNEST_OLLAMA_MODEL="qwen3:4b" alpnest
+```
+
+The response is written beside the source as
+`.<section>.llm-draft.md`. That file is hidden from normal section navigation,
+shown with `v`, and safe to regenerate. Alpnest never applies the response to
+the source section automatically.
+
+Before opening the TUI, verify the complete local path:
+
+```sh
+alpnest doctor
+```
+
+The doctor initializes an empty runtime and checks the bundled helper, Python,
+the Ollama service, and the selected model. It exits non-zero when local draft
+generation is not ready and prints the concrete next command where possible.
 
 ## Mail pipeline
 
@@ -907,7 +954,13 @@ keeps working when no model is available at all.
 Install from the repository:
 
 ```sh
-cargo install --path . --force
+cargo install --locked --path . --force
+```
+
+Verify the first-run and local-model setup:
+
+```sh
+alpnest doctor
 ```
 
 Run during development:
@@ -1076,8 +1129,8 @@ Important decisions:
 The content editor supports:
 
 - add content
-- edit existing content
 - remove existing content
+- edit existing body/context Markdown from the explorer
 
 Content creation is intended to be less frequent than panel creation.
 

@@ -13,6 +13,7 @@ pub struct ContentRegistry {
 impl ContentRegistry {
     pub fn load_default() -> io::Result<Self> {
         let paths = AlpnestPaths::resolve()?;
+        crate::bootstrap::ensure_initialized(&paths)?;
         Self::load_from_contents_dir(paths.contents_dir)
     }
 

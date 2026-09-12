@@ -1,7 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentEditorMode {
     AddNewContent,
-    EditExistingContent,
     RemoveExistingContent,
 }
 
@@ -9,15 +8,13 @@ impl ContentEditorMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::AddNewContent => "add new content",
-            Self::EditExistingContent => "edit existing content",
             Self::RemoveExistingContent => "remove existing content",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::AddNewContent => Self::EditExistingContent,
-            Self::EditExistingContent => Self::RemoveExistingContent,
+            Self::AddNewContent => Self::RemoveExistingContent,
             Self::RemoveExistingContent => Self::AddNewContent,
         }
     }
@@ -277,16 +274,6 @@ impl ContentEditorState {
 
                 fields.extend([ContentEditorField::Create, ContentEditorField::Cancel]);
             }
-            ContentEditorMode::EditExistingContent => {
-                fields.extend([
-                    ContentEditorField::ExistingContent,
-                    ContentEditorField::ContentName,
-                    ContentEditorField::ContentKind,
-                    ContentEditorField::ContextEditor,
-                    ContentEditorField::Create,
-                    ContentEditorField::Cancel,
-                ]);
-            }
             ContentEditorMode::RemoveExistingContent => {
                 fields.extend([
                     ContentEditorField::ExistingContent,
@@ -431,10 +418,7 @@ impl ContentEditorState {
 
     pub fn validate_for_create(&self) -> Result<(), String> {
         if self.mode != ContentEditorMode::AddNewContent {
-            return Err(
-                "edit existing content is not implemented yet; use add new content first"
-                    .to_string(),
-            );
+            return Err("switch to add new content before creating".to_string());
         }
 
         if self.slug().is_empty() {
